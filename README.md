@@ -6,8 +6,8 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-3776AB" alt="Python">
 </p>
 <p align="center">
-  <img src="https://img.shields.io/badge/advantage__tradeoffs-swappable%20backend%2C%20speech%20runs%20on%20your%20machine%2C%20boards%20keep%20lights%20working%20offline%2C%20shows%20only%20what%20is%20set%20up-2ea44f" alt="advantage_tradeoffs: swappable backend, speech runs on your machine, boards keep lights working offline, shows only what is set up">
-  <img src="https://img.shields.io/badge/disadvantage__tradeoffs-needs%20a%20backend%20to%20think%2C%20boards%20stream%20audio%20to%20your%20server%2C%20one%20board%20model%20tested%2C%20web%20agents%20run%20as%20your%20user-d97706" alt="disadvantage_tradeoffs: needs a backend to think, boards stream audio to your server, one board model tested, web agents run as your user">
+  <a href="#trade-offs"><img src="https://img.shields.io/badge/advantage__tradeoffs-Adapter%20pattern%2C%20Plugin%20architecture%2C%20Graceful%20degradation%2C%20Data%20locality%2C%20Progressive%20disclosure-2ea44f" alt="advantage_tradeoffs: Adapter pattern, Plugin architecture, Graceful degradation, Data locality, Progressive disclosure"></a>
+  <a href="#trade-offs"><img src="https://img.shields.io/badge/disadvantage__tradeoffs-External%20dependency%2C%20Thin%20clients%2C%20Narrow%20hardware%20support%2C%20Ambient%20authority-d97706" alt="disadvantage_tradeoffs: External dependency, Thin clients, Narrow hardware support, Ambient authority"></a>
 </p>
 
 **Tana is an all-in-one AI assistant you host yourself: a web app for your phone, laptop or car, voice in and
@@ -111,6 +111,22 @@ scrape_configs:
 ```bash
 cd server && .venv/bin/python -m unittest discover -s tests
 ```
+
+## Trade-offs
+
+The design choices behind the badges at the top, named after the patterns and trade-offs they are.
+
+| | Trade-off | What it means here |
+|---|---|---|
+| Advantage | **Adapter pattern** | One assistant interface, with adapters for Rameness, Claude Code, Codex, pi and dsh; switching is one setting. |
+| Advantage | **Plugin architecture** | The voice boards are a separate service (`tana-boards`) that Tana doesn't need in order to run. |
+| Advantage | **Graceful degradation** | Without the server, boards keep running their room's automatic lights; without a backend, they keep their non-AI functions. |
+| Advantage | **Data locality** | Speech recognition (Whisper) and synthesis (Kokoro) run on your machine. |
+| Advantage | **Progressive disclosure** | Only what is set up is shown: no API key, no Claude chats; no boards server, no boards screen. |
+| Disadvantage | **External dependency** | Tana has no brain of its own; every answer needs a configured backend. |
+| Disadvantage | **Thin clients** | Boards stream audio to your server, which hears the wake phrase; voice doesn't work offline. |
+| Disadvantage | **Narrow hardware support** | One board model has been built and tested. |
+| Disadvantage | **Ambient authority** | Agents started from the web run with the permissions of the user running Tana. |
 
 ## License and disclaimer
 
