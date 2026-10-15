@@ -1,0 +1,17 @@
+server/.venv/
+__pycache__/
+*.wav
+data/
+anthropic.key
+# the boards' firmware fork lives in its own git repo; its changes are exported to firmware/patches/
+plugins/boards/firmware/xiaozhi-esp32/
+plugins/boards/firmware/releases/
+plugins/boards/firmware/staging/
+plugins/boards/firmware/build.log
+# your own settings and data stay local
+server/config.yaml
+plugins/boards/config.yaml
+*.egg-info/
+.venv/
+
+build/

@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Tana</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<div id="login" class="screen" hidden>
+  <form id="login-form" class="card login-card" autocomplete="on">
+    <h1>Tana</h1>
+    <p class="muted">Sign in to talk with Tana or Claude.</p>
+    <input id="login-password" type="password" autocomplete="current-password" placeholder="Password" required>
+    <input id="login-code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="6-digit code" required>
+    <button type="submit" class="primary">Sign in</button>
+    <p id="login-error" class="error" role="alert"></p>
+  </form>
+</div>
+
+<div id="app" class="screen" hidden>
+  <aside id="sidebar">
+    <div class="sidebar-head">
+      <span class="logo">Tana</span>
+      <button id="close-sidebar" class="icon only-narrow" aria-label="Close list">✕</button>
+    </div>
+    <div class="new-buttons">
+      <button id="new-tana" class="primary">+ Tana</button>
+      <button id="new-claude" class="primary alt">+ Claude</button>
+      <button id="new-cc" class="primary code">+ Claude Code</button>
+    </div>
+    <div class="filters" role="tablist">
+      <button data-filter="all" class="chip active">All</button>
+      <button data-filter="web" class="chip">Chats</button>
+      <button data-filter="device" class="chip">Boards</button>
+      <button data-filter="claude-code" class="chip">Claude Code</button>
+      <button data-filter="sessions" class="chip">Sessions</button>
+      <button data-filter="rameness" class="chip" hidden>Rameness</button>
+      <button data-filter="rameness-agents" class="chip" hidden>Rameness agents</button>
+    </div>
+    <ul id="threads"></ul>
+    <div class="sidebar-foot">
+      <form id="screen-name-form" class="screen-name">
+        <label for="screen-name">This screen's name (shown on your phone)</label>
+        <div><input id="screen-name" maxlength="40" placeholder="e.g. Tesla"><button class="primary">Save</button></div>
+      </form>
+      <button id="open-micmode">Use this device as a microphone</button>
+      <button id="open-devices">Boards &amp; volume</button>
+      <button id="open-keys">Siri Shortcut</button>
+      <button id="logout" class="subtle">Sign out</button>
+    </div>
+  </aside>
+
+  <main id="main">
+    <header id="topbar">
+      <button id="open-sidebar" class="icon only-narrow" aria-label="Conversations">☰</button>
+      <h2 id="thread-title">New conversation</h2>
+      <div id="brain-switch" class="segmented" role="group" aria-label="Who answers">
+        <button data-brain="tana">Tana</button>
+        <button data-brain="claude">Claude</button>
+      </div>
+      <button id="rm-retire" class="subtle" hidden>Retire agent</button>
+      <button id="toggle-speak" class="icon" aria-pressed="true" title="Read replies aloud">🔊</button>
+    </header>
+
+    <section id="messages" aria-live="polite"></section>
+    <p id="readonly-note" class="muted center" hidden></p>
+
+    <form id="composer">
+      <button type="button" id="mic" class="mic" aria-label="Talk">🎤</button>
+      <textarea id="input" rows="1" placeholder="Message…" enterkeyhint="send"></textarea>
+      <button type="submit" id="send" class="primary">Send</button>
+      <button type="button" id="stop" class="danger" hidden>Stop</button>
+    </form>
+    <div class="handsfree">
+      <label><input type="checkbox" id="handsfree"> Hands-free: keep listening after each reply</label>
+      <label><input type="checkbox" id="autosend"> Auto-send dictated text</label>
+      <span id="phone-mic-note" class="muted" hidden>📱 Phone microphone connected</span>
+    </div>
+  </main>
+</div>
+
+<div id="micmode" class="screen" hidden>
+  <div class="micmode">
+    <div class="micmode-head">
+      <button id="exit-micmode" class="subtle">← Back</button>
+      <label>Send to <select id="mic-target"></select></label>
+    </div>
+    <p id="mic-status" class="muted center">Looking for screens…</p>
+    <button id="big-mic" class="big-mic" aria-label="Talk">🎤</button>
+    <label class="handsfree center-row"><input type="checkbox" id="mic-continuous"> Hands-free: say “Hey Tana” to start</label>
+    <p id="mic-last" class="mic-last"></p>
+    <form id="mic-type" class="mic-type">
+      <input id="mic-type-input" placeholder="…or type / dictate here" enterkeyhint="send">
+      <button class="primary">Send</button>
+    </form>
+  </div>
+</div>
+
+<div id="devices" class="modal" hidden>
+  <div class="card modal-card">
+    <div class="modal-head"><h2>Boards</h2><button id="close-devices" class="icon" aria-label="Close">✕</button></div>
+    <div id="device-list"></div>
+  </div>
+</div>
+
+<div id="keys" class="modal" hidden>
+  <div class="card modal-card">
+    <div class="modal-head"><h2>Siri Shortcut</h2><button id="close-keys" class="icon" aria-label="Close">✕</button></div>
+    <p class="muted">Talk to Tana with your phone locked: say “Hey Siri, Tana”. A key can only send
+      questions to Tana (no history, no board controls, no Claude Code). Delete it here if your phone is lost.</p>
+    <div id="key-list"></div>
+    <form id="key-form" class="mic-type"><input id="key-name" placeholder="Key name, e.g. iPhone" maxlength="40"><button class="primary">Create key</button></form>
+    <div id="key-new" hidden>
+      <p><strong>Copy this key now — it won't be shown again:</strong></p>
+      <input id="key-value" readonly>
+      <button id="key-copy" type="button">Copy</button>
+      <ol class="steps-list">
+        <li>Open the <b>Shortcuts</b> app → <b>+</b> → name it <b>Tana</b>.</li>
+        <li>Add <b>Dictate Text</b> (Stop Listening: After Pause).</li>
+        <li>Add <b>Get Contents of URL</b>: <code><span class="site-origin">https://your-tana-address</span>/api/shortcut/say</code><br>
+          Method <b>POST</b>; Header <code>Authorization</code> = <code>Bearer</code> + space + your key;
+          Request Body <b>JSON</b> with field <code>text</code> = <i>Dictated Text</i>.</li>
+        <li>Add <b>Get Dictionary Value</b> for key <code>speak</code>, then <b>Speak Text</b>.</li>
+        <li>Say “Hey Siri, Tana”. With the car screen open, the answer plays in the car; otherwise Siri reads it.</li>
+      </ol>
+    </div>
+  </div>
+</div>
+
+<div id="toast" role="status" hidden></div>
+<audio id="player" preload="auto"></audio>
+</body>
+</html>

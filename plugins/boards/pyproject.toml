@@ -1,0 +1,19 @@
+[project]
+name = "tana-boards"
+version = "0.1.0"
+description = "tana-boards: Tana's plugin for voice boards (xiaozhi-protocol ESP32 boards with a mic, speaker and screen)"
+license = "Apache-2.0"
+authors = [{ name = "Prog-Ramen" }]
+requires-python = ">=3.11"
+# tana provides tana.voice (speech engines); the rest are the boards' own needs
+dependencies = ["tana", "aiohttp>=3.10", "numpy", "soxr", "pyyaml", "astral"]
+
+[project.scripts]
+tana-boards = "tana_boards.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["tana_boards*"]

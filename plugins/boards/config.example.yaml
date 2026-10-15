@@ -1,0 +1,39 @@
+# tana-boards configuration: copy to config.yaml and edit. Anything omitted falls back to the defaults in
+# tana_boards/config.py. Board ids are their Wi-Fi MAC addresses (shown in the logs when a board checks in).
+
+server:
+  port: 8003                    # boards connect here (keep it on your local network; never forward it)
+  # public_host: 192.168.1.10   # the address boards use to reach this machine; auto-detected when empty
+  follow_up_seconds: 10         # a board stays awake this long after a reply for follow-up questions
+
+# What answers the boards: a swappable backend (see tana/assistant.py). Only `rameness` can call the boards'
+# own tools (volume, lights) and announce work that finishes later.
+assistant:
+  backend: rameness
+  url: http://127.0.0.1:7788
+
+presence:
+  auto_lights: false            # rooms' lights follow movement and voices after dark
+  location: {name: "Your town", lat: 0.0, lon: 0.0, tz: "UTC"}   # for sunset and sunrise
+
+firmware:
+  test_devices: []              # boards that get firmware from firmware/staging before everyone else
+
+# Boards that stream raw Wi-Fi measurements for presence sensing: {"<board id>": node number}
+ruview:
+  stream_devices: {}
+
+occupancy:
+  control_lights: []            # boards whose room lights follow the occupancy detector
+
+# Lights on a fixed daily timetable. Times: "sunset", "sunrise" or local "HH:MM".
+light_schedules: []
+#  - {light: Porch, on_at: sunset, off_at: "23:00"}
+
+# Room per board (names and lights can also be changed by talking to the board: "this is the office").
+rooms: {}
+#  "aa:bb:cc:dd:ee:01": {name: "Living room", lights: [LivingRoom], auto: true}
+
+# A name per board, said to the assistant so it knows where it is.
+devices: {}
+#  "aa:bb:cc:dd:ee:01": "Living room"

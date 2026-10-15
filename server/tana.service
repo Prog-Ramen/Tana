@@ -1,0 +1,18 @@
+# Tana (the web app) as a systemd service. Adjust the paths and user to your install, then:
+#   sudo cp tana.service /etc/systemd/system/ && sudo systemctl enable --now tana
+[Unit]
+Description=Tana web app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tana
+WorkingDirectory=/opt/tana/server
+ExecStart=/opt/tana/server/.venv/bin/tana -c /opt/tana/server/config.yaml
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+Environment=HF_HUB_OFFLINE=1
+
+[Install]
+WantedBy=multi-user.target

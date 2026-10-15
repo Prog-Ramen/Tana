@@ -1,0 +1,28 @@
+# Tana (the web app) configuration: copy to config.yaml and edit. Anything omitted falls back to the defaults in
+# tana/config.py.
+
+# What answers Tana's chats and the Siri Shortcut: rameness (a Rameness manager at url), claude-code, codex, pi, dsh
+assistant:
+  backend: rameness
+  url: http://127.0.0.1:7788
+
+rameness:
+  url: http://127.0.0.1:7788    # Rameness's own views (chats, agents, decisions waiting on you); omit to hide them
+boards:
+  url: http://127.0.0.1:8003    # tana-boards, for the boards screen; omit to hide it
+
+web:
+  port: 8004
+  local_port: 8005              # first-time setup and /metrics: keep it on your local network
+  # Your HTTPS reverse proxy's address; only it may connect, and only its X-Forwarded-For is trusted
+  trusted_proxies: ["127.0.0.1", "::1"]
+  origin: ""                    # e.g. https://tana.example.com
+  claude_code:
+    enabled: true
+    # networks allowed to run Claude Code from the web (in addition to the login); default: private networks
+    # allowed_networks: ["192.168.0.0/16", "10.0.0.0/8"]
+  rameness:
+    recent_hours: 24
+
+claude:
+  model: claude-opus-5-5        # the "+ Claude" chats; put an Anthropic API key in anthropic.key (mode 600)

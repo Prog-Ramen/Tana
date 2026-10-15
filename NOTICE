@@ -1,0 +1,19 @@
+Tana
+Copyright 2026 Prog-Ramen
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use this software except in
+compliance with the License. A copy is in the LICENSE file and at http://www.apache.org/licenses/LICENSE-2.0.
+
+The board firmware in plugins/boards/firmware is built from xiaozhi-esp32 (MIT License), which keeps its own
+license and copyright notices.
+
+DISCLAIMER
+
+Tana is provided "AS IS", without warranties or conditions of any kind, as set out in sections 7 and 8 of the
+License. Tana is a voice assistant and web app that can switch lights and other devices, flash firmware onto
+boards, process audio from microphones, and start AI agents and coding tools that run commands on your machine;
+its web app can be exposed to the internet. You alone are responsible for how you install, configure, secure and
+use it, for the people and places its microphones can hear, for every action taken through it, and for complying
+with the laws and the terms of the services and models you connect it to. Tana is not a safety or security system
+and must not be relied on for one. To the maximum extent permitted by law, the authors, contributors and Prog-Ramen
+shall not be liable for any claim, damages or other liability arising from the use of this software.

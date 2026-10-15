@@ -1,0 +1,1960 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8ae130c..17308e0 100755
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -9,5 +9,5 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+ # "Trim" the build. Include the minimal set of components, main, and anything it depends on.
+ idf_build_set_property(MINIMAL_BUILD ON)
+ 
+-set(PROJECT_VER "2.5.0")
++set(PROJECT_VER "3.5.5")
+ project(xiaozhi)
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+index ab6c8a7..9c02339 100644
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -37,6 +37,8 @@ set(SOURCES "audio/audio_codec.cc"
+             "system_info.cc"
+             "application.cc"
+             "ota.cc"
++            "tana_sense.cc"
++            "tana_fallback.cc"
+             "settings.cc"
+             "device_state_machine.cc"
+             "assets.cc"
+diff --git a/main/Kconfig.projbuild b/main/Kconfig.projbuild
+index f7f753b..b651b78 100644
+--- a/main/Kconfig.projbuild
++++ b/main/Kconfig.projbuild
+@@ -6,6 +6,41 @@ config OTA_URL
+     help
+         The application will access this URL to check for new firmwares and server address.
+ 
++config TANA_AMBIENT_LISTENING
++    bool "Tana: keep the voice channel open and let the server detect the wake word"
++    default n
++    help
++        The device connects to the server as soon as it is idle and streams the
++        microphone continuously. The server listens for "Hey Tana" and tells the
++        device when it is awake or dormant with {"type":"tana","state":...}.
++
++config TANA_WIFI_SENSING
++    bool "Tana: Wi-Fi (CSI) motion sensing for room presence"
++    default n
++    depends on TANA_AMBIENT_LISTENING && ESP_WIFI_CSI_ENABLED
++    help
++        Pings the router and measures channel state information to report a motion score to
++        the server once a second ({"type":"tana","sense":{...}}).
++
++config TANA_SONAR
++    bool "Tana: ultrasonic sonar (runs the audio codec at 48 kHz)"
++    default n
++    depends on TANA_AMBIENT_LISTENING
++    help
++        On request ({"type":"tana","sonar":{...}}) plays inaudible chirps and returns the averaged
++        echo recording ({"type":"tana","sonar_result":{...}}) for the server to analyse.
++
++config TANA_DIM_AFTER_SECONDS
++    int "Tana: dim the screen after this many dormant seconds (0 = never)"
++    default 60
++    depends on TANA_AMBIENT_LISTENING
++
++config TANA_DIM_BRIGHTNESS
++    int "Tana: brightness while dimmed (0-100)"
++    default 5
++    range 0 100
++    depends on TANA_AMBIENT_LISTENING
++
+ choice
+     prompt "Flash Assets"
+     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE
+diff --git a/main/application.cc b/main/application.cc
+index 31de205..7aa25a3 100644
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -8,6 +8,13 @@
+ #include "mcp_server.h"
+ #include "mqtt_protocol.h"
+ #include "settings.h"
++#include <esp_system.h>
++#include <algorithm>
++#include <climits>
++#if CONFIG_TANA_WIFI_SENSING
++#include "tana_sense.h"
++#include "tana_fallback.h"
++#endif
+ #include "system_info.h"
+ #include "text_glyph_payload.h"
+ #include "websocket_protocol.h"
+@@ -192,6 +199,14 @@ void Application::Run() {
+                 StopNotification();
+             }
+             SetDeviceState(kDeviceStateIdle);
++#if CONFIG_TANA_AMBIENT_LISTENING
++            if (tana_auto_connecting_) {
++                ESP_LOGW(TAG, "Ambient connect failed (%s), retry in %ds",
++                         last_error_message_.c_str(), tana_reconnect_delay_);
++                Board::GetInstance().GetDisplay()->SetStatus(Lang::Strings::CONNECTING);
++                last_error_message_.clear();
++            } else
++#endif
+             Alert(Lang::Strings::ERROR, last_error_message_.c_str(), "cancel",
+                   Lang::Sounds::OGG_EXCLAMATION);
+         }
+@@ -275,6 +290,9 @@ void Application::Run() {
+             clock_ticks_++;
+             auto display = Board::GetInstance().GetDisplay();
+             display->UpdateStatusBar();
++#if CONFIG_TANA_AMBIENT_LISTENING
++            TanaTick();
++#endif
+ 
+             // Print debug info every 10 seconds
+             if (clock_ticks_ % 10 == 0) {
+@@ -344,22 +362,90 @@ void Application::HandleActivationDoneEvent() {
+     const bool has_error = !last_error_message_.empty();
+     if (!has_error) {
+         auto display = Board::GetInstance().GetDisplay();
++#if !CONFIG_TANA_AMBIENT_LISTENING
+         std::string message = std::string(Lang::Strings::VERSION) + ota_->GetCurrentVersion();
+         display->ShowNotification(message.c_str());
++#endif
+         display->SetChatMessage("system", "");
+     }
+ 
+     // Release OTA object after activation is complete
+     ota_.reset();
++
++#if CONFIG_TANA_WIFI_SENSING
++    TanaFallback::GetInstance().Load();
++    TanaSense::GetInstance().Start([this](const TanaSenseReport& r) {
++        TanaFallback::GetInstance().Feed(r);  // takes over the room light if the server goes silent
++        // Build the JSON here (timer task) so only a string crosses into the main loop
++        std::string j;
++        j.reserve(2048);
++        char tmp[96];
++        snprintf(tmp, sizeof(tmp), "{\"motion\":%.5f,\"max\":%.5f,\"rssi\":%.1f,\"rssi_std\":%.2f,\"n\":%d,",
++                 r.motion, r.motion_max, r.rssi, r.rssi_std, r.packets);
++        j += tmp;
++        snprintf(tmp, sizeof(tmp), "\"fmt\":%d,\"csi_len\":%d,\"bins\":%d,", r.format, r.csi_len, r.active_bins);
++        j += tmp;
++        auto add_array = [&](const char* name, const float* v, int count, const char* fmt) {
++            j += "\"";
++            j += name;
++            j += "\":[";
++            for (int i = 0; i < count; i++) {
++                snprintf(tmp, sizeof(tmp), fmt, v[i]);
++                if (i) j += ",";
++                j += tmp;
++            }
++            j += "]";
++        };
++        add_array("profile", r.profile, TanaSenseReport::kProfileGroups, "%.4f");
++        j += ",";
++        add_array("phase", r.phase, TanaSenseReport::kProfileGroups, "%.3f");
++        j += ",\"series\":[";
++        for (int t = 0; t < TanaSenseReport::kSeriesRate; t++) {
++            if (t) j += ",";
++            if (!r.series_valid[t]) {
++                j += "null";
++                continue;
++            }
++            j += "[";
++            for (int g = 0; g < TanaSenseReport::kProfileGroups; g++) {
++                snprintf(tmp, sizeof(tmp), g ? ",%.4f" : "%.4f", r.series[t][g]);
++                j += tmp;
++            }
++            j += "]";
++        }
++        j += "],\"pseries\":[";
++        for (int t = 0; t < TanaSenseReport::kSeriesRate; t++) {
++            if (t) j += ",";
++            if (!r.series_valid[t]) {
++                j += "null";
++                continue;
++            }
++            j += "[";
++            for (int g = 0; g < TanaSenseReport::kProfileGroups; g++) {
++                snprintf(tmp, sizeof(tmp), g ? ",%.3f" : "%.3f", r.pseries[t][g]);
++                j += tmp;
++            }
++            j += "]";
++        }
++        j += "]}";
++        Schedule([this, j = std::move(j)]() {
++            if (protocol_ && protocol_->IsAudioChannelOpened()) {
++                protocol_->SendTanaSense(j);
++            }
++        });
++    });
++#endif
+     auto& board = Board::GetInstance();
+     board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+ 
++#if !CONFIG_TANA_AMBIENT_LISTENING  // Tana boots (and restarts after updates) silently
+     if (!has_error) {
+         Schedule([this]() {
+             // Play the success sound to indicate the device is ready
+             audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
+         });
+     }
++#endif
+ }
+ 
+ void Application::ActivationTask() {
+@@ -372,6 +458,13 @@ void Application::ActivationTask() {
+     // Check for new firmware version
+     CheckNewVersion();
+ 
++    if (ota_->HasNewAssets()) {
++        // Download happens in CheckAssetsVersion() early in the next boot
++        ESP_LOGI(TAG, "Rebooting to install new assets");
++        vTaskDelay(pdMS_TO_TICKS(500));
++        esp_restart();
++    }
++
+     // Initialize the protocol
+     InitializeProtocol();
+ 
+@@ -402,6 +495,12 @@ void Application::CheckAssetsVersion() {
+     if (!download_url.empty()) {
+         settings.EraseKey("download_url");
+ 
++#if CONFIG_TANA_AMBIENT_LISTENING
++        // Tana: update quietly (no sound, no on-screen announcement)
++        SetDeviceState(kDeviceStateUpgrading);
++        board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
++        bool success = assets.Download(download_url, [](int, size_t) {});
++#else
+         char message[256];
+         snprintf(message, sizeof(message), Lang::Strings::FOUND_NEW_ASSETS, download_url.c_str());
+         Alert(Lang::Strings::LOADING_ASSETS, message, "cloud_download", Lang::Sounds::OGG_UPGRADE);
+@@ -420,6 +519,7 @@ void Application::CheckAssetsVersion() {
+                     display->SetChatMessage("system", message.c_str());
+                 });
+             });
++#endif
+ 
+         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+         vTaskDelay(pdMS_TO_TICKS(1000));
+@@ -431,6 +531,7 @@ void Application::CheckAssetsVersion() {
+             SetDeviceState(kDeviceStateActivating);
+             return;
+         }
++        settings.SetString("version", settings.GetString("pending_version"));
+     }
+ 
+     // Apply assets
+@@ -440,7 +541,15 @@ void Application::CheckAssetsVersion() {
+ }
+ 
+ void Application::CheckNewVersion() {
++#if CONFIG_TANA_AMBIENT_LISTENING
++    // Tana: never give up. The board only learns how to reach the server from this check, so after
++    // a long server outage it must keep trying (silently, at most a minute apart) until it's back.
++    const int MAX_RETRY = INT_MAX;
++    const int MAX_RETRY_DELAY = 60;
++#else
+     const int MAX_RETRY = 10;
++    const int MAX_RETRY_DELAY = INT_MAX;
++#endif
+     int retry_count = 0;
+     int retry_delay = 10;  // Initial retry delay in seconds
+ 
+@@ -474,7 +583,11 @@ void Application::CheckNewVersion() {
+                 alert_message_length >= static_cast<int>(sizeof(buffer))) {
+                 snprintf(buffer, sizeof(buffer), "%s", err.Message());
+             }
++#if CONFIG_TANA_AMBIENT_LISTENING
++            display->SetStatus(Lang::Strings::CONNECTING);  // no alert sound: Tana stays silent
++#else
+             Alert(Lang::Strings::ERROR, buffer, "cloud_off", Lang::Sounds::OGG_EXCLAMATION);
++#endif
+ 
+             ESP_LOGW(TAG, "Check new version failed, retry in %d seconds (%d/%d)", retry_delay,
+                      retry_count, MAX_RETRY);
+@@ -484,7 +597,7 @@ void Application::CheckNewVersion() {
+                     break;
+                 }
+             }
+-            retry_delay *= 2;  // Double the retry delay
++            retry_delay = std::min(retry_delay * 2, MAX_RETRY_DELAY);  // Double the retry delay
+             continue;
+         }
+         retry_count = 0;
+@@ -559,6 +672,12 @@ void Application::InitializeProtocol() {
+ 
+     protocol_->OnAudioChannelOpened([this, codec, &board]() {
+         board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
++#if CONFIG_TANA_AMBIENT_LISTENING
++        Schedule([this]() {
++            tana_reconnect_delay_ = 1;
++            tana_auto_connecting_ = false;
++        });
++#endif
+         if (protocol_->server_sample_rate() != codec->output_sample_rate()) {
+             ESP_LOGW(TAG,
+                      "Server sample rate %d does not match device output sample rate %d, "
+@@ -572,6 +691,9 @@ void Application::InitializeProtocol() {
+         Schedule([this]() {
+             auto display = Board::GetInstance().GetDisplay();
+             display->SetChatMessage("system", "");
++#if CONFIG_TANA_AMBIENT_LISTENING
++            TanaSetAwake(false);
++#endif
+             SetDeviceState(kDeviceStateIdle);
+         });
+     });
+@@ -674,6 +796,117 @@ void Application::InitializeProtocol() {
+                     display->SetEmotion(emotion_str.c_str());
+                 });
+             }
++#if CONFIG_TANA_AMBIENT_LISTENING
++        } else if (strcmp(type->valuestring, "tana") == 0) {
++#if CONFIG_TANA_WIFI_SENSING
++            // {"type":"tana","csi_stream":{"host":"192.168.1.10","port":5005,"node":1}} (host "" = off)
++            auto stream = cJSON_GetObjectItem(root, "csi_stream");
++            if (cJSON_IsObject(stream)) {
++                auto host = cJSON_GetObjectItem(stream, "host");
++                auto port = cJSON_GetObjectItem(stream, "port");
++                auto node = cJSON_GetObjectItem(stream, "node");
++                TanaSense::GetInstance().StreamRaw(cJSON_IsString(host) ? host->valuestring : "",
++                                                   cJSON_IsNumber(port) ? port->valueint : 5005,
++                                                   cJSON_IsNumber(node) ? node->valueint : 1);
++            }
++            // {"type":"tana","fallback":{...}}: kit for running the room light without the server
++            auto fallback = cJSON_GetObjectItem(root, "fallback");
++            if (cJSON_IsObject(fallback)) {
++                char* kit = cJSON_PrintUnformatted(fallback);
++                if (kit) {
++                    TanaFallback::GetInstance().Configure(kit);
++                    cJSON_free(kit);
++                }
++            }
++            // {"type":"tana","probe":{"seconds":4,"targets":[{"ip":"192.168.1.20","mac":"aa:bb:.."}]}}
++            auto probe = cJSON_GetObjectItem(root, "probe");
++            if (cJSON_IsObject(probe)) {
++                std::vector<TanaSense::ProbeTarget> targets;
++                cJSON* t = nullptr;
++                cJSON_ArrayForEach(t, cJSON_GetObjectItem(probe, "targets")) {
++                    auto ip = cJSON_GetObjectItem(t, "ip");
++                    auto mac = cJSON_GetObjectItem(t, "mac");
++                    TanaSense::ProbeTarget target;
++                    unsigned m[6];
++                    if (cJSON_IsString(ip) && cJSON_IsString(mac) &&
++                        sscanf(mac->valuestring, "%x:%x:%x:%x:%x:%x", &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
++                        target.ip = ip->valuestring;
++                        for (int i = 0; i < 6; i++) target.mac[i] = m[i];
++                        targets.push_back(target);
++                    }
++                }
++                auto secs = cJSON_GetObjectItem(probe, "seconds");
++                int seconds = cJSON_IsNumber(secs) ? std::clamp(secs->valueint, 1, 10) : 4;
++                TanaSense::GetInstance().Probe(std::move(targets), seconds, [this](const std::string& result) {
++                    Schedule([this, result]() {
++                        if (protocol_) protocol_->SendTanaProbeResult(result);
++                    });
++                });
++            }
++#endif
++#if CONFIG_TANA_SONAR
++            // {"type":"tana","sonar":{"f0":19000,"f1":21000,"chirp_ms":5,"period_ms":50,"repeats":40,"amplitude":16000}}
++            auto sonar = cJSON_GetObjectItem(root, "sonar");
++            if (cJSON_IsObject(sonar)) {
++                AudioService::SonarRequest req;
++                auto num = [&](const char* k, int& v) {
++                    auto it = cJSON_GetObjectItem(sonar, k);
++                    if (cJSON_IsNumber(it)) v = it->valueint;
++                };
++                num("f0", req.f0); num("f1", req.f1); num("chirp_ms", req.chirp_ms);
++                num("period_ms", req.period_ms); num("repeats", req.repeats); num("amplitude", req.amplitude);
++                auto allch = cJSON_GetObjectItem(sonar, "all_channels");
++                req.all_channels = cJSON_IsTrue(allch);
++                req.repeats = std::clamp(req.repeats, 1, 200);
++                req.period_ms = std::clamp(req.period_ms, 10, req.all_channels ? 45 : 100);
++                req.chirp_ms = std::clamp(req.chirp_ms, 1, req.period_ms);
++                req.amplitude = std::clamp(req.amplitude, 0, 32000);
++                bool ok = audio_service_.RequestSonar(req, [this](std::vector<int16_t>&& pcm, int rate, int period) {
++                    // One message per channel (keeps each JSON string small): base64 of int16 LE samples
++                    static const char* b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++                    int channels = period > 0 ? int(pcm.size() / period) : 0;
++                    if (channels == 0) {
++                        Schedule([this]() {
++                            if (protocol_) protocol_->SendTanaSonarResult("{\"error\":\"no data\"}");
++                        });
++                        return;
++                    }
++                    for (int c = 0; c < channels; c++) {
++                        const auto* bytes = reinterpret_cast<const uint8_t*>(pcm.data() + c * period);
++                        size_t n = size_t(period) * 2;
++                        std::string enc;
++                        enc.reserve((n + 2) / 3 * 4);
++                        for (size_t i = 0; i < n; i += 3) {
++                            uint32_t v = bytes[i] << 16 | (i + 1 < n ? bytes[i + 1] << 8 : 0) | (i + 2 < n ? bytes[i + 2] : 0);
++                            enc += b64[v >> 18 & 63];
++                            enc += b64[v >> 12 & 63];
++                            enc += i + 1 < n ? b64[v >> 6 & 63] : '=';
++                            enc += i + 2 < n ? b64[v & 63] : '=';
++                        }
++                        std::string json = "{\"rate\":" + std::to_string(rate) + ",\"period\":" + std::to_string(period) +
++                                           ",\"channel\":" + std::to_string(c) + ",\"channels\":" + std::to_string(channels) +
++                                           ",\"pcm\":\"" + enc + "\"}";
++                        Schedule([this, json = std::move(json)]() {
++                            if (protocol_) protocol_->SendTanaSonarResult(json);
++                        });
++                    }
++                });
++                if (!ok) {
++                    Schedule([this]() {
++                        if (protocol_) protocol_->SendTanaSonarResult("{\"error\":\"busy\"}");
++                    });
++                }
++            }
++#endif
++            // "awake" / "dormant" switch modes; anything else (e.g. "ping") is a keepalive
++            // that only refreshes the channel's last-incoming timestamp.
++            auto state = cJSON_GetObjectItem(root, "state");
++            if (cJSON_IsString(state) && (strcmp(state->valuestring, "awake") == 0 ||
++                                          strcmp(state->valuestring, "dormant") == 0)) {
++                bool awake = strcmp(state->valuestring, "awake") == 0;
++                Schedule([this, awake]() { TanaSetAwake(awake); });
++            }
++#endif
+         } else if (strcmp(type->valuestring, "mcp") == 0) {
+             auto payload = cJSON_GetObjectItem(root, "payload");
+             if (cJSON_IsObject(payload)) {
+@@ -815,7 +1048,11 @@ void Application::HandleToggleChatEvent() {
+     } else if (state == kDeviceStateSpeaking) {
+         AbortSpeaking(kAbortReasonNone);
+     } else if (state == kDeviceStateListening) {
++#if CONFIG_TANA_AMBIENT_LISTENING
++        protocol_->SendWakeWordDetected("button");
++#else
+         protocol_->CloseAudioChannel();
++#endif
+     }
+ }
+ 
+@@ -1025,8 +1262,12 @@ void Application::HandleStateChangedEvent() {
+             display->SetChatMessage("system", "");
+             break;
+         case kDeviceStateListening:
++#if CONFIG_TANA_AMBIENT_LISTENING
++            TanaUpdateListeningUi();
++#else
+             display->SetStatus(Lang::Strings::LISTENING);
+             display->SetEmotion("neutral");
++#endif
+ 
+             // Make sure the audio processor is running
+             if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
+@@ -1223,6 +1464,13 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
+     }
+     ESP_LOGI(TAG, "Starting firmware upgrade from URL: %s", upgrade_url.c_str());
+ 
++#if CONFIG_TANA_AMBIENT_LISTENING
++    // Tana: update quietly (no sound, no on-screen announcement)
++    SetDeviceState(kDeviceStateUpgrading);
++    board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
++    audio_service_.Stop();
++    bool upgrade_success = Ota::Upgrade(upgrade_url, [](int, size_t) {});
++#else
+     Alert(Lang::Strings::OTA_UPGRADE, Lang::Strings::UPGRADING, "download",
+           Lang::Sounds::OGG_UPGRADE);
+     vTaskDelay(pdMS_TO_TICKS(3000));
+@@ -1243,6 +1491,7 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
+             display->SetChatMessage("system", message.c_str());
+         });
+     });
++#endif
+ 
+     if (!upgrade_success) {
+         // Upgrade failed, restart audio service and continue running
+@@ -1372,3 +1621,68 @@ void Application::ResetProtocol() {
+         protocol_.reset();
+     });
+ }
++
++#if CONFIG_TANA_AMBIENT_LISTENING
++void Application::TanaTick() {
++    auto state = GetDeviceState();
++    auto& board = Board::GetInstance();
++
++    // Keep the voice channel open: reconnect with exponential backoff while idle
++    if (state == kDeviceStateIdle && protocol_ && clock_ticks_ >= tana_reconnect_delay_) {
++        tana_auto_connecting_ = true;
++        tana_reconnect_delay_ = std::min(tana_reconnect_delay_ * 2, 60);
++        SetDeviceState(kDeviceStateConnecting);
++        Schedule([this]() { ContinueOpenAudioChannel(kListeningModeAutoStop); });
++        return;
++    }
++
++    // Dim the AMOLED while dormant to save power and avoid burn-in
++    auto backlight = board.GetBacklight();
++    if (state == kDeviceStateListening && !tana_awake_) {
++        tana_dormant_ticks_++;
++        if (CONFIG_TANA_DIM_AFTER_SECONDS > 0 && !tana_dimmed_ && backlight &&
++            tana_dormant_ticks_ >= CONFIG_TANA_DIM_AFTER_SECONDS) {
++            backlight->SetBrightness(CONFIG_TANA_DIM_BRIGHTNESS);
++            tana_dimmed_ = true;
++        }
++    } else {
++        tana_dormant_ticks_ = 0;
++        if (tana_dimmed_ && backlight) {
++            backlight->RestoreBrightness();
++            tana_dimmed_ = false;
++        }
++    }
++}
++
++void Application::TanaSetAwake(bool awake) {
++    bool changed = awake != tana_awake_;
++    if (!changed) {
++        return;
++    }
++    tana_awake_ = awake;
++    tana_dormant_ticks_ = 0;
++    if (awake && tana_dimmed_) {
++        if (auto backlight = Board::GetInstance().GetBacklight()) {
++            backlight->RestoreBrightness();
++        }
++        tana_dimmed_ = false;
++    }
++    if (GetDeviceState() == kDeviceStateListening) {
++        TanaUpdateListeningUi();
++        if (awake) {
++            audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
++        }
++    }
++}
++
++void Application::TanaUpdateListeningUi() {
++    auto display = Board::GetInstance().GetDisplay();
++    if (tana_awake_) {
++        display->SetStatus(Lang::Strings::LISTENING);
++        display->SetEmotion("neutral");
++    } else {
++        display->SetStatus("Say \"Hey Tana\"");
++        display->SetEmotion("sleepy");
++    }
++}
++#endif
+diff --git a/main/application.h b/main/application.h
+index f2b9a00..c912da3 100644
+--- a/main/application.h
++++ b/main/application.h
+@@ -152,6 +152,17 @@ private:
+     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
+     bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)
+     int clock_ticks_ = 0;
++#if CONFIG_TANA_AMBIENT_LISTENING
++    // Tana ambient mode: the voice channel stays open and the server decides when we are awake
++    bool tana_awake_ = false;
++    bool tana_dimmed_ = false;
++    bool tana_auto_connecting_ = false;
++    int tana_dormant_ticks_ = 0;
++    int tana_reconnect_delay_ = 1;
++    void TanaTick();
++    void TanaSetAwake(bool awake);
++    void TanaUpdateListeningUi();
++#endif
+     TaskHandle_t activation_task_handle_ = nullptr;
+ 
+ 
+diff --git a/main/audio/audio_codec.h b/main/audio/audio_codec.h
+index a267dbb..95a419a 100644
+--- a/main/audio/audio_codec.h
++++ b/main/audio/audio_codec.h
+@@ -33,6 +33,9 @@ public:
+     virtual void SetInputGain(float gain);
+     virtual void EnableInput(bool enable);
+     virtual void EnableOutput(bool enable);
++    // Tana sonar: capture every input channel (returns the channel count now delivered by Read),
++    // or restore normal capture with all=false. Codecs without multi-mic input keep their layout.
++    virtual int SetCaptureAllChannels(bool all) { return input_channels_; }
+ 
+     virtual void OutputData(std::vector<int16_t>& data);
+     virtual bool InputData(std::vector<int16_t>& data);
+diff --git a/main/audio/audio_service.cc b/main/audio/audio_service.cc
+index 7f7582b..a204558 100644
+--- a/main/audio/audio_service.cc
++++ b/main/audio/audio_service.cc
+@@ -1,4 +1,8 @@
+ #include "audio_service.h"
++
++#include <algorithm>
++
++#include <cmath>
+ #include <esp_log.h>
+ #include <cstring>
+ 
+@@ -278,6 +282,11 @@ void AudioService::AudioInputTask() {
+             continue;
+         }
+ 
++        if (sonar_pending_.exchange(false)) {
++            RunSonar();
++            continue;
++        }
++
+         /* Used for audio testing in NetworkConfiguring mode by clicking the BOOT button */
+         if (bits & AS_EVENT_AUDIO_TESTING_RUNNING) {
+             bool testing_queue_full = false;
+@@ -879,3 +888,93 @@ bool AudioService::InitializeAudioEngine() {
+     audio_engine_->EnableDeviceAec(device_aec_enabled_);
+     return true;
+ }
++
++bool AudioService::RequestSonar(const SonarRequest& req,
++                                std::function<void(std::vector<int16_t>&&, int, int)> done) {
++    if (sonar_pending_.load() || !IsPlaybackIdle()) {
++        return false;
++    }
++    sonar_req_ = req;
++    sonar_done_ = std::move(done);
++    sonar_pending_.store(true);
++    return true;
++}
++
++void AudioService::RunSonar() {
++    auto done = std::move(sonar_done_);
++    const auto req = sonar_req_;
++    int rate = codec_->input_sample_rate();
++    if (rate < 44100 || codec_->output_sample_rate() != rate) {
++        ESP_LOGW(TAG, "Sonar needs a 44.1/48 kHz codec (input %d, output %d)", rate, codec_->output_sample_rate());
++        if (done) done({}, rate, 0);
++        return;
++    }
++    const int period = rate * req.period_ms / 1000;
++    const int chirp = rate * req.chirp_ms / 1000;
++
++    // One period: Hann-windowed linear sweep, then silence
++    struct Play {
++        AudioCodec* codec;
++        std::vector<int16_t> frame;
++        int repeats;
++        SemaphoreHandle_t finished;
++    };
++    auto* play = new Play{codec_, std::vector<int16_t>(period, 0), req.repeats, xSemaphoreCreateBinary()};
++    for (int i = 0; i < chirp; i++) {
++        float t = float(i) / rate;
++        float T = float(chirp) / rate;
++        float phase = 2 * float(M_PI) * (req.f0 * t + (req.f1 - req.f0) * t * t / (2 * T));
++        float w = 0.5f - 0.5f * std::cos(2 * float(M_PI) * i / (chirp - 1));
++        play->frame[i] = int16_t(req.amplitude * w * std::sin(phase));
++    }
++
++    if (!codec_->output_enabled()) codec_->EnableOutput(true);
++    if (!codec_->input_enabled()) codec_->EnableInput(true);
++    const int ch = req.all_channels ? codec_->SetCaptureAllChannels(true) : codec_->input_channels();
++
++    xTaskCreate(
++        [](void* arg) {
++            auto* p = static_cast<Play*>(arg);
++            for (int r = 0; r < p->repeats; r++) {
++                p->codec->OutputData(p->frame);
++            }
++            xSemaphoreGive(p->finished);
++            vTaskDelete(nullptr);
++        },
++        "sonar_play", 3072, play, 9, nullptr);
++
++    // Capture repeats+1 periods in small chunks; skip the first period, sum the rest by position
++    std::vector<int32_t> acc(period * ch, 0);
++    const int chunk = period / 8 > 0 ? period / 8 : period;
++    std::vector<int16_t> block(chunk * ch);
++    int summed = 0;
++    for (int r = 0; r <= req.repeats; r++) {
++        bool ok = true;
++        for (int off = 0; off < period; off += chunk) {
++            int n = std::min(chunk, period - off);
++            block.resize(n * ch);
++            if (!codec_->InputData(block)) { ok = false; break; }
++            if (r == 0) continue;
++            for (int i = 0; i < n * ch; i++) acc[off * ch + i] += block[i];
++        }
++        if (!ok) break;
++        if (r > 0) summed++;
++    }
++    xSemaphoreTake(play->finished, pdMS_TO_TICKS(req.repeats * req.period_ms + 2000));
++    vSemaphoreDelete(play->finished);
++    delete play;
++    if (req.all_channels) codec_->SetCaptureAllChannels(false);
++
++    // Average in place, then hand back channel-major int16 data (ch blocks of `period` samples)
++    std::vector<int16_t> avg(period * ch);
++    for (int c = 0; c < ch; c++) {
++        for (int i = 0; i < period; i++) {
++            avg[c * period + i] = summed ? int16_t(acc[i * ch + c] / summed) : 0;
++        }
++    }
++    acc.clear();
++    acc.shrink_to_fit();
++    ESP_LOGI(TAG, "Sonar: %d periods x %d samples x %d ch at %d Hz", summed, period, ch, rate);
++    audio_input_need_warmup_.store(true);
++    if (done) done(std::move(avg), rate, period);
++}
+diff --git a/main/audio/audio_service.h b/main/audio/audio_service.h
+index f8b510f..171946a 100644
+--- a/main/audio/audio_service.h
++++ b/main/audio/audio_service.h
+@@ -2,6 +2,8 @@
+ #define AUDIO_SERVICE_H
+ 
+ #include <atomic>
++#include <functional>
++#include <vector>
+ #include <chrono>
+ #include <condition_variable>
+ #include <memory>
+@@ -137,6 +139,15 @@ public:
+     void ReleaseWakeWordResources();
+     void EnableVoiceProcessing(bool enable);
+     void EnableAudioTesting(bool enable);
++
++    // Tana sonar: play `repeats` chirps (f0->f1 Hz, chirp_ms long, one every period_ms) and record
++    // at the same time; the recording is averaged period by period (echoes add up, noise cancels).
++    // `done` gets the averaged period (input-rate samples) or an empty vector on failure.
++    struct SonarRequest {
++        int f0 = 19000, f1 = 21000, chirp_ms = 5, period_ms = 50, repeats = 40, amplitude = 16000;
++        bool all_channels = false;  // capture every microphone channel (channel-major result)
++    };
++    bool RequestSonar(const SonarRequest& req, std::function<void(std::vector<int16_t>&&, int, int)> done);
+     void EnableDeviceAec(bool enable);
+ 
+     void SetCallbacks(AudioServiceCallbacks& callbacks);
+@@ -150,6 +161,10 @@ public:
+ 
+ private:
+     AudioCodec* codec_ = nullptr;
++    std::atomic<bool> sonar_pending_{false};
++    SonarRequest sonar_req_;
++    std::function<void(std::vector<int16_t>&&, int, int)> sonar_done_;
++    void RunSonar();
+     AudioServiceCallbacks callbacks_;
+     std::unique_ptr<AudioEngine> audio_engine_;
+     std::unique_ptr<AudioDebugger> audio_debugger_;
+diff --git a/main/audio/codecs/box_audio_codec.cc b/main/audio/codecs/box_audio_codec.cc
+index 5210ecb..8134571 100644
+--- a/main/audio/codecs/box_audio_codec.cc
++++ b/main/audio/codecs/box_audio_codec.cc
+@@ -257,3 +257,32 @@ int BoxAudioCodec::Write(const int16_t* data, int samples) {
+     }
+     return samples;
+ }
++
++int BoxAudioCodec::SetCaptureAllChannels(bool all) {
++    // Reopen the ES7210 with all four TDM slots (MIC1, MIC3, MIC2, MIC4) for sonar, or restore
++    // the normal single-microphone (+reference) layout.
++    std::lock_guard<std::mutex> lock(data_if_mutex_);
++    if (input_enabled_) {
++        esp_codec_dev_close(input_dev_);
++    }
++    esp_codec_dev_sample_info_t fs = {
++        .bits_per_sample = 16,
++        .channel = 4,
++        .channel_mask = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0),
++        .sample_rate = (uint32_t)input_sample_rate_,
++        .mclk_multiple = 0,
++    };
++    if (all) {
++        fs.channel_mask = 0x0F;
++    } else if (input_reference_) {
++        fs.channel_mask |= ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1);
++    }
++    esp_codec_dev_open(input_dev_, &fs);
++    esp_codec_dev_set_in_channel_gain(input_dev_, all ? 0x0F : ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), input_gain_);
++    if (!all && input_reference_ && reference_gain_channel_ >= 0) {
++        esp_codec_dev_set_in_channel_gain(input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(reference_gain_channel_),
++                                          reference_gain_);
++    }
++    input_enabled_ = true;
++    return all ? 4 : input_channels_;
++}
+diff --git a/main/audio/codecs/box_audio_codec.h b/main/audio/codecs/box_audio_codec.h
+index 3f85ed5..abe6547 100644
+--- a/main/audio/codecs/box_audio_codec.h
++++ b/main/audio/codecs/box_audio_codec.h
+@@ -40,6 +40,7 @@ public:
+     virtual void SetOutputVolume(int volume) override;
+     virtual void EnableInput(bool enable) override;
+     virtual void EnableOutput(bool enable) override;
++    virtual int SetCaptureAllChannels(bool all) override;
+ };
+ 
+ #endif // _BOX_AUDIO_CODEC_H
+diff --git a/main/boards/common/board.cc b/main/boards/common/board.cc
+index e0880dc..5cd395c 100644
+--- a/main/boards/common/board.cc
++++ b/main/boards/common/board.cc
+@@ -5,6 +5,7 @@
+ #include "system_info.h"
+ 
+ #include <esp_chip_info.h>
++#include <esp_system.h>
+ #include <esp_log.h>
+ #include <esp_ota_ops.h>
+ #include <esp_random.h>
+@@ -104,6 +105,8 @@ std::string Board::GetSystemInfoJson() {
+             R"(",)";
+     json += R"("mac_address":")" + SystemInfo::GetMacAddress() + R"(",)";
+     json += R"("uuid":")" + uuid_ + R"(",)";
++    // Tana: why the board last restarted (power, crash, watchdog...), reported at every check-in
++    json += R"("reset_reason":)" + std::to_string((int)esp_reset_reason()) + R"(,)";
+     json += R"("chip_model_name":")" + SystemInfo::GetChipModelName() + R"(",)";
+ 
+     esp_chip_info_t chip_info;
+diff --git a/main/boards/common/wifi_board.cc b/main/boards/common/wifi_board.cc
+index 5b3721d..8e62059 100644
+--- a/main/boards/common/wifi_board.cc
++++ b/main/boards/common/wifi_board.cc
+@@ -54,7 +54,7 @@ void WifiBoard::StartNetwork() {
+ 
+     // Initialize WiFi manager
+     WifiManagerConfig config;
+-    config.ssid_prefix = "Xiaozhi";
++    config.ssid_prefix = "Tana";
+     config.language = Lang::CODE;
+     config.show_ota_config = true;
+     config.show_sleep_config = true;
+diff --git a/main/boards/waveshare/esp32-c6-touch-amoled-2.16/config.h b/main/boards/waveshare/esp32-c6-touch-amoled-2.16/config.h
+index 3a2d1dc..edb8046 100644
+--- a/main/boards/waveshare/esp32-c6-touch-amoled-2.16/config.h
++++ b/main/boards/waveshare/esp32-c6-touch-amoled-2.16/config.h
+@@ -3,8 +3,14 @@
+ 
+ #include <driver/gpio.h>
+ 
++#if CONFIG_TANA_SONAR
++// 48 kHz so the speaker/mics can carry ~19-21 kHz sonar chirps (speech is resampled as usual)
++#define AUDIO_INPUT_SAMPLE_RATE  48000
++#define AUDIO_OUTPUT_SAMPLE_RATE 48000
++#else
+ #define AUDIO_INPUT_SAMPLE_RATE  24000
+ #define AUDIO_OUTPUT_SAMPLE_RATE 24000
++#endif
+ 
+ #define AUDIO_INPUT_REFERENCE    false
+ #define AUDIO_I2S_GPIO_MCLK  GPIO_NUM_19
+diff --git a/main/boards/waveshare/esp32-c6-touch-amoled-2.16/config.json b/main/boards/waveshare/esp32-c6-touch-amoled-2.16/config.json
+index 6054842..0f51762 100644
+--- a/main/boards/waveshare/esp32-c6-touch-amoled-2.16/config.json
++++ b/main/boards/waveshare/esp32-c6-touch-amoled-2.16/config.json
+@@ -10,6 +10,19 @@
+                 "CONFIG_USE_DEFAULT_MESSAGE_STYLE=y",
+                 "CONFIG_USE_MULTILINE_CHAT_MESSAGE=y"
+             ]
++        },
++        {
++            "name": "tana-c6-amoled-2.16",
++            "sdkconfig_append": [
++                "CONFIG_TANA_AMBIENT_LISTENING=y",
++                "CONFIG_WAKE_WORD_DISABLED=y",
++                "CONFIG_USE_DEFAULT_MESSAGE_STYLE=y",
++                "CONFIG_USE_MULTILINE_CHAT_MESSAGE=y",
++                "CONFIG_ESP_WIFI_CSI_ENABLED=y",
++                "CONFIG_TANA_WIFI_SENSING=y",
++                "CONFIG_TANA_SONAR=y",
++                "CONFIG_OTA_URL=\"http://192.168.1.10:8003/tana/ota/\""
++            ]
+         }
+     ]
+-}
+\ No newline at end of file
++}
+diff --git a/main/boards/waveshare/esp32-c6-touch-amoled-2.16/esp32-c6-touch-amoled-2.16.cc b/main/boards/waveshare/esp32-c6-touch-amoled-2.16/esp32-c6-touch-amoled-2.16.cc
+index 0c766dc..1e15dfd 100644
+--- a/main/boards/waveshare/esp32-c6-touch-amoled-2.16/esp32-c6-touch-amoled-2.16.cc
++++ b/main/boards/waveshare/esp32-c6-touch-amoled-2.16/esp32-c6-touch-amoled-2.16.cc
+@@ -298,9 +298,88 @@ private:
+         ESP_LOGI(TAG, "Touch panel initialized successfully");
+     }
+ 
++#if CONFIG_TANA_AMBIENT_LISTENING
++    // Tana sensing helpers (hidden "user-only" tools the server calls; not offered to the LLM)
++    i2c_master_dev_handle_t imu_ = nullptr;
++
++    bool ImuReadRegs(uint8_t reg, uint8_t* out, size_t len) {
++        return imu_ && i2c_master_transmit_receive(imu_, &reg, 1, out, len, 100) == ESP_OK;
++    }
++    bool ImuWrite(uint8_t reg, uint8_t val) {
++        uint8_t buf[2] = {reg, val};
++        return imu_ && i2c_master_transmit(imu_, buf, 2, 100) == ESP_OK;
++    }
++    bool ImuInit() {
++        if (imu_) return true;
++        for (uint8_t addr : {0x6B, 0x6A}) {
++            if (i2c_master_probe(i2c_bus_, addr, 50) != ESP_OK) continue;
++            i2c_device_config_t cfg = {.dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = addr, .scl_speed_hz = 400000};
++            if (i2c_master_bus_add_device(i2c_bus_, &cfg, &imu_) != ESP_OK) continue;
++            uint8_t who = 0;
++            if (ImuReadRegs(0x00, &who, 1) && who == 0x05) {  // QMI8658 WHO_AM_I
++                ImuWrite(0x02, 0x40);  // CTRL1: address auto-increment, little-endian data
++                ImuWrite(0x03, 0x16);  // CTRL2: accel +/-4 g, ~117 Hz
++                ImuWrite(0x04, 0x56);  // CTRL3: gyro +/-512 dps, ~117 Hz
++                ImuWrite(0x08, 0x03);  // CTRL7: accel + gyro on
++                vTaskDelay(pdMS_TO_TICKS(60));
++                ESP_LOGI(TAG, "QMI8658 at 0x%02x", addr);
++                return true;
++            }
++            i2c_master_bus_rm_device(imu_);
++            imu_ = nullptr;
++        }
++        return false;
++    }
++
++    void InitializeTanaTools() {
++        auto& mcp = McpServer::GetInstance();
++        mcp.AddUserOnlyTool("self.tana.i2c_scan", "List I2C addresses that respond on the codec/sensor bus",
++                            PropertyList(), [this](const PropertyList&) -> ReturnValue {
++                                std::string out = "[";
++                                for (int a = 0x08; a < 0x78; a++) {
++                                    if (i2c_master_probe(i2c_bus_, a, 20) == ESP_OK) {
++                                        char b[8];
++                                        snprintf(b, sizeof(b), "%s%d", out.size() > 1 ? "," : "", a);
++                                        out += b;
++                                    }
++                                }
++                                return out + "]";
++                            });
++        mcp.AddUserOnlyTool("self.tana.imu", "Average accelerometer (g), gyro (dps) and chip temperature",
++                            PropertyList(), [this](const PropertyList&) -> ReturnValue {
++                                if (!ImuInit()) return std::string("{\"error\":\"no QMI8658\"}");
++                                double acc[3] = {}, gyr[3] = {};
++                                int n = 0;
++                                for (int i = 0; i < 32; i++) {
++                                    uint8_t d[12];
++                                    if (ImuReadRegs(0x35, d, 12)) {
++                                        for (int k = 0; k < 3; k++) {
++                                            acc[k] += int16_t(d[2 * k] | d[2 * k + 1] << 8) / 8192.0;
++                                            gyr[k] += int16_t(d[6 + 2 * k] | d[7 + 2 * k] << 8) / 64.0;
++                                        }
++                                        n++;
++                                    }
++                                    vTaskDelay(pdMS_TO_TICKS(10));
++                                }
++                                uint8_t t[2] = {};
++                                ImuReadRegs(0x33, t, 2);
++                                double temp = int8_t(t[1]) + t[0] / 256.0;
++                                char out[200];
++                                if (n == 0) return std::string("{\"error\":\"read failed\"}");
++                                snprintf(out, sizeof(out),
++                                         "{\"accel_g\":[%.4f,%.4f,%.4f],\"gyro_dps\":[%.2f,%.2f,%.2f],\"temp_c\":%.2f,\"n\":%d}",
++                                         acc[0] / n, acc[1] / n, acc[2] / n, gyr[0] / n, gyr[1] / n, gyr[2] / n, temp, n);
++                                return std::string(out);
++                            });
++    }
++#endif
++
+     // 初始化工具
+     void InitializeTools() {
+         auto& mcp_server = McpServer::GetInstance();
++#if CONFIG_TANA_AMBIENT_LISTENING
++        InitializeTanaTools();
++#endif
+         mcp_server.AddTool("self.system.reconfigure_wifi",
+                            "End this conversation and enter WiFi configuration mode.\n"
+                            "**CAUTION** You must ask the user to confirm this action.",
+diff --git a/main/ota.cc b/main/ota.cc
+index 07d5116..8c60c56 100644
+--- a/main/ota.cc
++++ b/main/ota.cc
+@@ -215,6 +215,24 @@ NetworkResult<> Ota::CheckVersion() {
+         ESP_LOGW(TAG, "No server_time section found!");
+     }
+ 
++    // Tana: the server can publish an assets image (fonts, emoji) alongside the firmware.
++    // Queue it for download on the next boot when its version differs from the installed one.
++    has_new_assets_ = false;
++    cJSON *assets = cJSON_GetObjectItem(root, "assets");
++    if (cJSON_IsObject(assets)) {
++        cJSON *version = cJSON_GetObjectItem(assets, "version");
++        cJSON *url = cJSON_GetObjectItem(assets, "url");
++        if (cJSON_IsString(version) && cJSON_IsString(url)) {
++            Settings settings("assets", true);
++            if (settings.GetString("version") != version->valuestring) {
++                ESP_LOGI(TAG, "New assets version: %s", version->valuestring);
++                settings.SetString("download_url", url->valuestring);
++                settings.SetString("pending_version", version->valuestring);
++                has_new_assets_ = true;
++            }
++        }
++    }
++
+     has_new_version_ = false;
+     cJSON *firmware = cJSON_GetObjectItem(root, "firmware");
+     if (cJSON_IsObject(firmware)) {
+diff --git a/main/ota.h b/main/ota.h
+index eda3fd7..780874f 100644
+--- a/main/ota.h
++++ b/main/ota.h
+@@ -23,6 +23,7 @@ public:
+     bool HasWebsocketConfig() { return has_websocket_config_; }
+     bool HasActivationCode() { return has_activation_code_; }
+     bool HasServerTime() { return has_server_time_; }
++    bool HasNewAssets() { return has_new_assets_; }
+     bool StartUpgrade(std::function<void(int progress, size_t speed)> callback);
+     static bool Upgrade(const std::string& firmware_url, std::function<void(int progress, size_t speed)> callback);
+     void MarkCurrentVersionValid();
+@@ -41,6 +42,7 @@ private:
+     bool has_mqtt_config_ = false;
+     bool has_websocket_config_ = false;
+     bool has_server_time_ = false;
++    bool has_new_assets_ = false;
+     bool has_activation_code_ = false;
+     bool has_serial_number_ = false;
+     bool has_activation_challenge_ = false;
+diff --git a/main/protocols/protocol.cc b/main/protocols/protocol.cc
+index ac591b5..5e95474 100644
+--- a/main/protocols/protocol.cc
++++ b/main/protocols/protocol.cc
+@@ -99,6 +99,18 @@ void Protocol::SendStopListening() {
+     SendText(message);
+ }
+ 
++void Protocol::SendTanaSense(const std::string& sense_json) {
++    SendText("{\"session_id\":\"" + session_id_ + "\",\"type\":\"tana\",\"sense\":" + sense_json + "}");
++}
++
++void Protocol::SendTanaProbeResult(const std::string& result_json) {
++    SendText("{\"session_id\":\"" + session_id_ + "\",\"type\":\"tana\",\"probe_result\":" + result_json + "}");
++}
++
++void Protocol::SendTanaSonarResult(const std::string& result_json) {
++    SendText("{\"session_id\":\"" + session_id_ + "\",\"type\":\"tana\",\"sonar_result\":" + result_json + "}");
++}
++
+ void Protocol::SendMcpMessage(const std::string& payload) {
+     std::string message =
+         "{\"session_id\":\"" + session_id_ + "\",\"type\":\"mcp\",\"payload\":" + payload + "}";
+diff --git a/main/protocols/protocol.h b/main/protocols/protocol.h
+index cfa0dd2..a042c42 100644
+--- a/main/protocols/protocol.h
++++ b/main/protocols/protocol.h
+@@ -66,6 +66,13 @@ public:
+     virtual void SendStopListening();
+     virtual void SendAbortSpeaking(AbortReason reason);
+     virtual void SendMcpMessage(const std::string& message);
++    // Tana: presence-sensing report, sent as {"type":"tana","sense":{...}}
++    // sense_json: the JSON object for "sense"
++    void SendTanaSense(const std::string& sense_json);
++    // Tana: {"type":"tana","probe_result":<json object>}
++    void SendTanaProbeResult(const std::string& result_json);
++    // Tana: {"type":"tana","sonar_result":<json object>}
++    void SendTanaSonarResult(const std::string& result_json);
+ 
+ protected:
+     std::function<void(const cJSON* root)> on_incoming_json_;
+diff --git a/main/protocols/websocket_protocol.cc b/main/protocols/websocket_protocol.cc
+index e0e3df9..f17fdcc 100644
+--- a/main/protocols/websocket_protocol.cc
++++ b/main/protocols/websocket_protocol.cc
+@@ -206,6 +206,9 @@ std::string WebsocketProtocol::GetHelloMessage() {
+     cJSON_AddBoolToObject(features, "aec", true);
+ #endif
+     cJSON_AddBoolToObject(features, "mcp", true);
++#if CONFIG_TANA_AMBIENT_LISTENING
++    cJSON_AddBoolToObject(features, "ambient", true);
++#endif
+     cJSON_AddItemToObject(root, "features", features);
+     AddTextFontCapabilities(root);
+     cJSON_AddStringToObject(root, "transport", "websocket");
+diff --git a/main/tana_fallback.cc b/main/tana_fallback.cc
+new file mode 100644
+index 0000000..b0fb60a
+--- /dev/null
++++ b/main/tana_fallback.cc
+@@ -0,0 +1,306 @@
++#include "tana_fallback.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <ctime>
++
++#include <cJSON.h>
++#include <esp_log.h>
++#include <esp_timer.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++#include <lwip/sockets.h>
++#include <esp_sntp.h>
++
++#include "settings.h"
++
++#define TAG "TanaFallback"
++
++namespace {
++
++// SP530E command: "SPTECH\0" + [cmd,0,0,0] + payload length (2 bytes, big-endian) + payload
++struct LightCommand {
++    std::string ip;
++    bool on;
++};
++
++void LightTask(void* arg) {
++    auto* cmd = static_cast<LightCommand*>(arg);
++    uint8_t packet[14] = {'S', 'P', 'T', 'E', 'C', 'H', 0, 0x50, 0, 0, 0, 0, 1, (uint8_t)(cmd->on ? 1 : 0)};
++    for (int attempt = 0; attempt < 3; attempt++) {
++        int s = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
++        if (s < 0) break;
++        timeval tv = {.tv_sec = 4, .tv_usec = 0};
++        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
++        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++        sockaddr_in addr = {};
++        addr.sin_family = AF_INET;
++        addr.sin_port = htons(8587);
++        inet_pton(AF_INET, cmd->ip.c_str(), &addr.sin_addr);
++        bool ok = connect(s, (sockaddr*)&addr, sizeof(addr)) == 0 && send(s, packet, sizeof(packet), 0) == sizeof(packet);
++        vTaskDelay(pdMS_TO_TICKS(300));  // the controller needs a moment before the connection closes
++        close(s);
++        if (ok) {
++            ESP_LOGI(TAG, "light %s %s", cmd->ip.c_str(), cmd->on ? "on" : "off");
++            break;
++        }
++        ESP_LOGW(TAG, "light %s unreachable (attempt %d)", cmd->ip.c_str(), attempt + 1);
++        vTaskDelay(pdMS_TO_TICKS(1000));
++    }
++    delete cmd;
++    vTaskDelete(nullptr);
++}
++
++float Clamp6(float v) { return std::min(v, 6.0f); }
++
++}  // namespace
++
++void TanaFallback::Load() {
++    Settings settings("tana_fb", false);
++    auto json = settings.GetString("kit");
++    last_kit_us_ = 1;  // counts as "heard at boot": the board takes over only after 3 min without a kit
++    // Its own clock from the internet, so it knows day from night even if the server is down at boot
++    if (!esp_sntp_enabled()) {
++        esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
++        esp_sntp_setservername(0, "pool.ntp.org");
++        esp_sntp_setservername(1, "time.google.com");
++        esp_sntp_init();
++    }
++    if (!json.empty() && Parse(json)) {
++        ESP_LOGI(TAG, "fallback kit loaded (light %s, %d dark periods, %d scheduled)", light_ip_.c_str(), dark_count_,
++                 schedule_count_);
++    }
++}
++
++void TanaFallback::Configure(const std::string& json) {
++    if (!Parse(json)) {
++        return;
++    }
++    last_kit_us_ = esp_timer_get_time();
++    // The fingerprints drift a little every minute: save to flash at most hourly (spares the flash)
++    if (last_save_us_ == 0 || last_kit_us_ - last_save_us_ > 3600LL * 1000000) {
++        Settings settings("tana_fb", true);
++        settings.SetString("kit", json);
++        last_save_us_ = last_kit_us_;
++    }
++}
++
++bool TanaFallback::Parse(const std::string& json) {
++    cJSON* root = cJSON_Parse(json.c_str());
++    if (!root) return false;
++    bool ok = false;
++    auto ip = cJSON_GetObjectItem(root, "light_ip");
++    auto dark = cJSON_GetObjectItem(root, "dark");
++    auto empty = cJSON_GetObjectItem(root, "empty");
++    auto schedule = cJSON_GetObjectItem(root, "schedule");
++    if (cJSON_IsString(ip) && (cJSON_IsObject(empty) || cJSON_IsArray(schedule))) {
++        light_ip_ = ip->valuestring;
++        dark_count_ = 0;
++        cJSON* p;
++        if (cJSON_IsArray(dark)) cJSON_ArrayForEach(p, dark) {
++            if (dark_count_ >= kMaxDark || cJSON_GetArraySize(p) != 2) break;
++            dark_[dark_count_][0] = (long)cJSON_GetArrayItem(p, 0)->valuedouble;
++            dark_[dark_count_][1] = (long)cJSON_GetArrayItem(p, 1)->valuedouble;
++            dark_count_++;
++        }
++        auto lat = cJSON_GetObjectItem(root, "lat");
++        auto lon = cJSON_GetObjectItem(root, "lon");
++        auto offset = cJSON_GetObjectItem(root, "dark_offset_minutes");
++        has_location_ = cJSON_IsNumber(lat) && cJSON_IsNumber(lon);
++        if (has_location_) {
++            lat_ = lat->valuedouble;
++            lon_ = lon->valuedouble;
++        }
++        dark_offset_min_ = cJSON_IsNumber(offset) ? offset->valueint : 0;
++        auto from = cJSON_GetObjectItem(root, "allowed_from");
++        auto until = cJSON_GetObjectItem(root, "allowed_until");
++        auto tz = cJSON_GetObjectItem(root, "tz_offset_minutes");
++        allowed_from_ = cJSON_IsNumber(from) ? from->valueint : -1;
++        allowed_until_ = cJSON_IsNumber(until) ? until->valueint : -1;
++        tz_offset_min_ = cJSON_IsNumber(tz) ? tz->valueint : 0;
++        auto read_print = [&](cJSON* o, int which) {
++            auto mean = cJSON_GetObjectItem(o, "mean");
++            if (!cJSON_IsArray(mean) || cJSON_GetArraySize(mean) < kGroups) return false;
++            for (int k = 0; k < kGroups; k++) mean_[which][k] = (float)cJSON_GetArrayItem(mean, k)->valuedouble;
++            spread_[which] = std::max(1e-6f, (float)cJSON_GetObjectItem(o, "spread")->valuedouble);
++            rssi_med_[which] = (float)cJSON_GetObjectItem(o, "rssi")->valuedouble;
++            rssi_spread_[which] = std::max(1e-6f, (float)cJSON_GetObjectItem(o, "rssi_spread")->valuedouble);
++            return true;
++        };
++        has_empty_ = cJSON_IsObject(empty) && read_print(empty, 0);
++        auto occ = cJSON_GetObjectItem(root, "occupied");
++        has_occupied_ = has_empty_ && cJSON_IsObject(occ) && read_print(occ, 1);
++        schedule_count_ = 0;
++        if (cJSON_IsArray(schedule)) cJSON_ArrayForEach(p, schedule) {
++            if (schedule_count_ >= kMaxSchedule || cJSON_GetArraySize(p) != 2) break;
++            schedule_[schedule_count_][0] = (long)cJSON_GetArrayItem(p, 0)->valuedouble;
++            schedule_[schedule_count_][1] = (long)cJSON_GetArrayItem(p, 1)->valuedouble;
++            schedule_count_++;
++        }
++        ok = has_empty_ || schedule_count_ > 0;
++        auto enter = cJSON_GetObjectItem(root, "shape_enter");
++        if (cJSON_IsNumber(enter)) shape_enter_ = (float)enter->valuedouble;
++        auto margin = cJSON_GetObjectItem(root, "exit_margin");
++        if (cJSON_IsNumber(margin)) exit_margin_ = (float)margin->valuedouble;
++    }
++    cJSON_Delete(root);
++    configured_ = configured_ || ok;
++    return ok;
++}
++
++bool TanaFallback::Active() const {
++    if (!configured_) return false;
++    return esp_timer_get_time() - last_kit_us_ > (int64_t)kHeartbeatTimeout * 1000000;
++}
++
++// NOAA sunrise/sunset (within ~3 min of the server's astral library), as UTC epochs
++// for the given UTC date; times past midnight UTC simply run into the next day.
++void TanaFallback::SunTimes(long day_start_utc, int doy, double lat, double lon, long* rise, long* set) {
++    double g = 2 * M_PI / 365 * (doy - 1);
++    double eq = 229.18 * (0.000075 + 0.001868 * cos(g) - 0.032077 * sin(g) - 0.014615 * cos(2 * g) - 0.040849 * sin(2 * g));
++    double de = 0.006918 - 0.399912 * cos(g) + 0.070257 * sin(g) - 0.006758 * cos(2 * g) + 0.000907 * sin(2 * g)
++                - 0.002697 * cos(3 * g) + 0.00148 * sin(3 * g);
++    double la = lat * M_PI / 180;
++    double c = cos(90.833 * M_PI / 180) / (cos(la) * cos(de)) - tan(la) * tan(de);
++    double ha = acos(std::max(-1.0, std::min(1.0, c))) * 180 / M_PI;
++    *rise = day_start_utc + (long)((720 - 4 * (lon + ha) - eq) * 60);
++    *set = day_start_utc + (long)((720 - 4 * (lon - ha) - eq) * 60);
++}
++
++bool TanaFallback::IsDark(long now) const {
++    if (now < 1700000000) return true;  // clock not set yet: don't let that block the light
++    if (allowed_from_ >= 0 && allowed_until_ >= 0) {
++        // the user's hours, e.g. nothing switches on after 11 PM
++        long local = now + tz_offset_min_ * 60;
++        int m = (int)((local % 86400 + 86400) % 86400 / 60);
++        bool inside = allowed_from_ <= allowed_until_ ? (m >= allowed_from_ && m < allowed_until_)
++                                                     : (m >= allowed_from_ || m < allowed_until_);
++        if (!inside) return false;
++    }
++    if (has_location_) {
++        for (int d = -1; d <= 1; d++) {     // daylight periods of yesterday, today and tomorrow (UTC dates)
++            time_t t = now + d * 86400;
++            tm u;
++            gmtime_r(&t, &u);
++            long day_start = (long)t - (u.tm_hour * 3600 + u.tm_min * 60 + u.tm_sec);
++            long rise, set;
++            SunTimes(day_start, u.tm_yday + 1, lat_, lon_, &rise, &set);
++            if (now >= rise && now < set + dark_offset_min_ * 60) return false;
++        }
++        return true;
++    }
++    for (int i = 0; i < dark_count_; i++) {
++        if (now >= dark_[i][0] && now < dark_[i][1]) return true;
++    }
++    return false;
++}
++
++// A timetable light: switched only at its on/off moments (a switch by hand in between sticks).
++void TanaFallback::RunSchedule(long now) {
++    if (schedule_count_ == 0 || now < 1700000000) return;   // no timetable, or the clock isn't set yet
++    if (schedule_checked_ == 0) schedule_checked_ = now;    // taking over: act from now on, not on the past
++    for (int i = 0; i < schedule_count_; i++) {
++        for (int which = 0; which < 2; which++) {
++            long t = schedule_[i][which];
++            if (schedule_checked_ < t && t <= now) {
++                ESP_LOGI(TAG, "timetable: light %s", which == 0 ? "on" : "off");
++                SwitchLight(which == 0);
++            }
++        }
++    }
++    schedule_checked_ = now;
++}
++
++void TanaFallback::SwitchLight(bool on) {
++    if (light_ip_.empty()) return;
++    auto* cmd = new LightCommand{light_ip_, on};
++    if (xTaskCreate(LightTask, "tana_light", 4096, cmd, 3, nullptr) != pdPASS) {
++        delete cmd;
++    }
++}
++
++// Same distances as the server (tana/occupancy.py _distance): shape = mean |cur - mean| / spread,
++// capped at 6; with signal strength, the average of the shape and |rssi - median| / spread terms.
++float TanaFallback::ShapeZ(const float* cur, const float* mean, float spread) const {
++    float d = 0;
++    for (int k = 0; k < kGroups; k++) d += fabsf(cur[k] - mean[k]);
++    return Clamp6(d / kGroups / spread);
++}
++
++float TanaFallback::BodyDistance(const float* shape, float rssi, int which) const {
++    float r = Clamp6(fabsf(rssi - rssi_med_[which]) / rssi_spread_[which]);
++    return (r + ShapeZ(shape, mean_[which], spread_[which])) / 2;
++}
++
++void TanaFallback::Feed(const TanaSenseReport& r) {
++    bool active = Active();
++    if (active != was_active_) {
++        if (active) {
++            ESP_LOGW(TAG, "server silent: fallback light control ON");
++        } else {
++            ESP_LOGI(TAG, "server back: fallback light control OFF");
++        }
++        was_active_ = active;
++        schedule_checked_ = 0;
++        occupied_ = false;  // unknown on takeover; entering or leaving switches the light
++        pending_entry_us_ = 0;
++        entry_hits_ = exit_hits_ = 0;
++    }
++    // keep the last 5 s of signal and the movement baseline even while the server is in charge
++    memcpy(recent_[recent_i_], r.profile, sizeof(recent_[0]));
++    recent_rssi_[recent_i_] = r.rssi;
++    recent_i_ = (recent_i_ + 1) % 5;
++    recent_n_ = std::min(recent_n_ + 1, 5);
++    int64_t now_us = esp_timer_get_time();
++    bool burst = r.motion_max > std::max(0.11f, 2.0f * quiet_peak_);
++    if (burst) {
++        burst_times_[0] = burst_times_[1];
++        burst_times_[1] = burst_times_[2];
++        burst_times_[2] = now_us;
++    } else {
++        quiet_peak_ += (r.motion_max - quiet_peak_) / 120.0f;
++    }
++    if (!active) return;
++    RunSchedule((long)time(nullptr));
++    if (!has_empty_ || recent_n_ < 5) return;
++
++    float cur[kGroups] = {};
++    float rssi = 0;
++    for (int i = 0; i < 5; i++) {
++        for (int k = 0; k < kGroups; k++) cur[k] += recent_[i][k] / 5;
++        rssi += recent_rssi_[i] / 5;
++    }
++    long now = (long)time(nullptr);
++
++    if (!occupied_) {
++        // movement is only a precursor: the shape must leave the empty room's shape (3 s in a row)
++        bool strong = burst && burst_times_[0] && now_us - burst_times_[0] <= 15 * 1000000LL;
++        if (strong && !pending_entry_us_) pending_entry_us_ = now_us;
++        if (pending_entry_us_ && now_us - pending_entry_us_ > 120 * 1000000LL) {
++            pending_entry_us_ = 0;
++            entry_hits_ = 0;
++        }
++        if (!pending_entry_us_) return;
++        float z = ShapeZ(cur, mean_[0], spread_[0]);
++        entry_hits_ = z > shape_enter_ ? entry_hits_ + 1 : 0;
++        if (entry_hits_ >= 3) {
++            occupied_ = true;
++            pending_entry_us_ = 0;
++            entry_hits_ = exit_hits_ = 0;
++            ESP_LOGI(TAG, "occupied (shape %.1fx)%s", z, IsDark(now) ? ", light on" : " (daylight: light stays)");
++            if (IsDark(now)) SwitchLight(true);
++        }
++    } else if (has_occupied_) {
++        // left: within 60 s of movement, closer to the empty fingerprint than the occupied one
++        bool recent_burst = burst_times_[2] && now_us - burst_times_[2] <= 60 * 1000000LL;
++        float margin = BodyDistance(cur, rssi, 1) - BodyDistance(cur, rssi, 0);
++        exit_hits_ = (recent_burst && margin >= exit_margin_) ? exit_hits_ + 1 : 0;
++        if (exit_hits_ >= 3) {
++            occupied_ = false;
++            exit_hits_ = 0;
++            ESP_LOGI(TAG, "empty (margin %+.1f), light off", margin);
++            SwitchLight(false);
++        }
++    }
++}
+diff --git a/main/tana_fallback.h b/main/tana_fallback.h
+new file mode 100644
+index 0000000..ef244bd
+--- /dev/null
++++ b/main/tana_fallback.h
+@@ -0,0 +1,84 @@
++#ifndef TANA_FALLBACK_H
++#define TANA_FALLBACK_H
++
++#include <string>
++
++#include "tana_sense.h"
++
++// Board-side fallback for the room light while the Tana server is unreachable.
++//
++// Two kinds of rooms: a light that follows occupancy (the kit carries learned fingerprints), and a light
++// on a daily timetable (the kit carries the next on/off times, "schedule"). A kit can carry either or both.
++//
++// The server normally decides occupancy and switches the lights. Every minute it sends this board
++// a "fallback kit" ({"type":"tana","fallback":{...}}): the light to control, the dark hours, and
++// the learned empty/occupied fingerprints (signal shape + strength). The kit doubles as a
++// heartbeat. If no kit arrives for kHeartbeatTimeout, the board runs the same entry/exit rules on
++// its own Wi-Fi measurements and switches the light directly (SP530E, TCP 8587). When kits arrive
++// again it stops and the server is in charge. The kit is kept in NVS, so it survives reboots.
++class TanaFallback {
++public:
++    static TanaFallback& GetInstance() {
++        static TanaFallback instance;
++        return instance;
++    }
++
++    void Load();                               // read the kit saved in NVS (boot)
++    void Configure(const std::string& json);   // a new kit from the server (also the heartbeat)
++    void Feed(const TanaSenseReport& r);       // once a second from TanaSense
++    bool Active() const;
++
++private:
++    TanaFallback() = default;
++    bool Parse(const std::string& json);
++    bool IsDark(long now) const;
++    static void SunTimes(long day_start_utc, int day_of_year, double lat, double lon, long* rise, long* set);
++    void SwitchLight(bool on);
++    void RunSchedule(long now);
++    float ShapeZ(const float* cur, const float* mean, float spread) const;
++    float BodyDistance(const float* shape, float rssi, int which) const;  // which: 0 empty, 1 occupied
++
++    static constexpr int kGroups = TanaSenseReport::kProfileGroups;
++    static constexpr int kHeartbeatTimeout = 180;  // seconds without a kit before taking over
++    static constexpr int kMaxDark = 32;
++    static constexpr int kMaxSchedule = 16;        // on/off pairs: two weeks of a daily timetable
++
++    bool configured_ = false;
++    int64_t last_kit_us_ = 0;
++    std::string light_ip_;
++    long dark_[kMaxDark][2] = {};
++    int dark_count_ = 0;
++    bool has_location_ = false;     // dark hours computed on the board from the location
++    double lat_ = 0, lon_ = 0;
++    int dark_offset_min_ = 0;
++    int allowed_from_ = -1, allowed_until_ = -1;  // local minutes of day (e.g. 720..1380 = until 11 PM)
++    int tz_offset_min_ = 0;
++    int64_t last_save_us_ = 0;
++    // fingerprints: [0] empty, [1] occupied
++    float mean_[2][kGroups] = {};
++    float spread_[2] = {1, 1};
++    float rssi_med_[2] = {};
++    float rssi_spread_[2] = {1, 1};
++    bool has_occupied_ = false;
++    bool has_empty_ = false;        // occupancy fingerprints present: the light follows the room
++    long schedule_[kMaxSchedule][2] = {};   // [on, off] UTC epochs of a timetable light
++    int schedule_count_ = 0;
++    long schedule_checked_ = 0;     // switch only at the moments themselves, like the server
++    float shape_enter_ = 4.0f;
++    float exit_margin_ = 1.0f;
++
++    // running state
++    bool occupied_ = false;
++    bool was_active_ = false;
++    float recent_[5][kGroups] = {};
++    float recent_rssi_[5] = {};
++    int recent_n_ = 0;
++    int recent_i_ = 0;
++    float quiet_peak_ = 0.06f;      // slow average of per-second movement peaks
++    int64_t burst_times_[3] = {};   // last three movement bursts (us)
++    int64_t pending_entry_us_ = 0;
++    int entry_hits_ = 0;
++    int exit_hits_ = 0;
++};
++
++#endif
+diff --git a/main/tana_sense.cc b/main/tana_sense.cc
+new file mode 100644
+index 0000000..68c8fce
+--- /dev/null
++++ b/main/tana_sense.cc
+@@ -0,0 +1,423 @@
++#include "tana_sense.h"
++
++#include <cmath>
++#include <cstring>
++
++#include <esp_log.h>
++#include <esp_netif.h>
++#include <esp_timer.h>
++#include <esp_wifi.h>
++#include <freertos/FreeRTOS.h>
++#include <lwip/ip_addr.h>
++#include <ping/ping_sock.h>
++#include <soc/soc_caps.h>
++#include <freertos/queue.h>
++#include <lwip/sockets.h>
++
++#define TAG "TanaSense"
++
++namespace {
++
++constexpr int kMaxSubcarriers = 256;  // HE20 (Wi-Fi 6) CSI carries 256 bins, 242 active
++constexpr float kBaselineAlpha = 0.02f;  // ~2.5 s at 20 packets/s
++constexpr int G = TanaSenseReport::kProfileGroups;
++constexpr int S = TanaSenseReport::kSeriesRate;
++
++uint8_t g_bssid[6];
++float g_baseline[kMaxSubcarriers];
++int g_baseline_n = 0;  // active subcarriers in the baseline (0 = not initialised)
++int64_t g_last_he_us = 0;  // last time a Wi-Fi 6 frame arrived; older formats are skipped meanwhile
++int64_t g_tick_start_us = 0;
++
++// Work buffers for the CSI callback (it always runs in the Wi-Fi task, one frame at a time)
++float g_amp[kMaxSubcarriers];
++float g_phase[kMaxSubcarriers];
++int g_bin[kMaxSubcarriers];
++
++// Raw CSI streaming (RuView ADR-018 frames) via a small sender task
++struct RawFrame {
++    uint16_t len;
++    uint8_t data[20 + 384];
++};
++QueueHandle_t g_raw_queue = nullptr;
++volatile bool g_raw_enabled = false;
++uint8_t g_raw_node = 1;
++uint32_t g_raw_seq = 0;
++struct sockaddr_in g_raw_dest;
++
++void QueueRawFrame(const wifi_csi_info_t* info, int format) {
++    if (!g_raw_enabled || g_raw_queue == nullptr) return;
++    static RawFrame f;  // Wi-Fi task only
++    uint16_t iq = info->len;
++    if (iq > sizeof(f.data) - 20) iq = sizeof(f.data) - 20;
++    uint32_t magic = 0xC5110001;
++    uint16_t nsub = iq / 2;
++    int ch = info->rx_ctrl.channel;
++    uint32_t freq = (ch >= 1 && ch <= 13) ? 2412 + (ch - 1) * 5 : (ch == 14 ? 2484 : 0);
++    uint32_t seq = g_raw_seq++;
++    memcpy(&f.data[0], &magic, 4);
++    f.data[4] = g_raw_node;
++    f.data[5] = 1;  // antennas
++    memcpy(&f.data[6], &nsub, 2);
++    memcpy(&f.data[8], &freq, 4);
++    memcpy(&f.data[12], &seq, 4);
++    f.data[16] = (uint8_t)(int8_t)info->rx_ctrl.rssi;
++    f.data[17] = (uint8_t)(int8_t)info->rx_ctrl.noise_floor;
++    f.data[18] = format == 4 || format == 6 ? 1 : format == 5 ? 2 : format == 7 ? 3 : format >= 0 ? 0 : 0xFF;
++    f.data[19] = 0;
++    memcpy(&f.data[20], info->buf, iq);
++    if (info->first_word_invalid && iq >= 4) memset(&f.data[20], 0, 4);
++    f.len = 20 + iq;
++    xQueueSend(g_raw_queue, &f, 0);  // drop if the sender is behind
++}
++
++portMUX_TYPE g_lock = portMUX_INITIALIZER_UNLOCKED;
++struct {
++    float sum, max, rssi_sum, rssi_sq;
++    int n;
++    float profile[G];
++    float phase[G];
++    int profile_n;
++    float series[S][G];
++    float pseries[S][G];
++    int series_n[S];
++    int format_count[16];
++    int csi_len, active_bins;
++} g_acc;
++
++std::function<void(const TanaSenseReport&)> g_on_report;
++
++// Nearest-light probe state (only touched while a probe runs)
++constexpr int kMaxProbe = 8;
++struct ProbeSlot {
++    uint8_t mac[6];
++    float rssi_sum;
++    int n;
++};
++ProbeSlot g_probe[kMaxProbe];
++int g_probe_count = 0;
++
++void OnPromiscuous(void* buf, wifi_promiscuous_pkt_type_t type) {
++    auto* pkt = static_cast<wifi_promiscuous_pkt_t*>(buf);
++    if (pkt->rx_ctrl.sig_len < 24) return;
++    const uint8_t* transmitter = pkt->payload + 10;  // 802.11 header: addr2
++    for (int i = 0; i < g_probe_count; i++) {
++        if (memcmp(transmitter, g_probe[i].mac, 6) == 0) {
++            portENTER_CRITICAL(&g_lock);
++            g_probe[i].rssi_sum += pkt->rx_ctrl.rssi;
++            g_probe[i].n++;
++            portEXIT_CRITICAL(&g_lock);
++            return;
++        }
++    }
++}
++
++bool IsHe(int format) { return format >= 4 && format <= 7; }
++
++void OnCsi(void* ctx, wifi_csi_info_t* info) {
++    if (info == nullptr || info->buf == nullptr || memcmp(info->mac, g_bssid, 6) != 0) {
++        return;  // only the router's replies: a fixed transmitter makes the signal comparable
++    }
++#if SOC_WIFI_HE_SUPPORT
++    int format = info->rx_ctrl.cur_bb_format;
++#else
++    int format = -1;
++#endif
++    int64_t now = esp_timer_get_time();
++    if (IsHe(format)) {
++        g_last_he_us = now;
++    } else if (now - g_last_he_us < 2000000) {
++        return;  // Wi-Fi 6 frames are arriving: don't mix in coarser older-format ones
++    }
++
++    QueueRawFrame(info, format);
++
++    const int8_t* buf = info->buf;
++    int total = info->len / 2;
++    if (total > kMaxSubcarriers) total = kMaxSubcarriers;
++    // Non-HE frames pack several 64-bin training fields back to back (L-LTF, then HT-LTF); each
++    // block is in FFT order (0..31, then -32..-1). Use the last full 64-bin block (HT-LTF when
++    // present) and walk it from -32 to 31 so neighbouring bins really are neighbours. HE frames
++    // are one 256-bin field in the same FFT order.
++    int block = IsHe(format) ? total : 64;
++    if (total < block) block = total;
++    int base = (total / block - 1) * block;
++    int half = block / 2;
++
++    // Active subcarriers only (guard bands and DC come back as zeros)
++    int n = 0;
++    float mean = 0;
++    for (int s = -half; s < half; s++) {
++        int k = base + (s < 0 ? s + block : s);
++        if (k < 2 && info->first_word_invalid) continue;  // first 4 bytes unreliable
++        float im = buf[2 * k], re = buf[2 * k + 1];
++        if (im == 0 && re == 0) continue;
++        g_amp[n] = std::sqrt(re * re + im * im);
++        g_phase[n] = std::atan2(im, re);
++        g_bin[n] = s;  // true subcarrier index, for the phase fit
++        mean += g_amp[n];
++        n++;
++    }
++    if (n < 16) return;
++    mean /= n;
++    if (mean < 1.0f) return;
++
++    float dev = 0;
++    if (g_baseline_n != n) {
++        for (int k = 0; k < n; k++) g_baseline[k] = g_amp[k] / mean;
++        g_baseline_n = n;
++        return;
++    }
++    // Movement: compare the normalized profile to its slow-moving average
++    for (int k = 0; k < n; k++) {
++        float v = g_amp[k] / mean;
++        dev += std::fabs(v - g_baseline[k]);
++        g_baseline[k] += kBaselineAlpha * (v - g_baseline[k]);
++    }
++    dev /= n;
++
++    // Phase: unwrap across subcarriers, then remove the straight-line part (timing offset and
++    // clock error differ per packet and add a slope + constant); what remains is the channel.
++    for (int k = 1; k < n; k++) {
++        float d = g_phase[k] - g_phase[k - 1];
++        while (d > float(M_PI)) { g_phase[k] -= 2 * float(M_PI); d -= 2 * float(M_PI); }
++        while (d < -float(M_PI)) { g_phase[k] += 2 * float(M_PI); d += 2 * float(M_PI); }
++    }
++    float sx = 0, sy = 0, sxx = 0, sxy = 0;
++    for (int k = 0; k < n; k++) {
++        float x = g_bin[k], y = g_phase[k];
++        sx += x; sy += y; sxx += x * x; sxy += x * y;
++    }
++    float denom = n * sxx - sx * sx;
++    float slope = denom != 0 ? (n * sxy - sx * sy) / denom : 0;
++    float icpt = (sy - slope * sx) / n;
++
++    // Per-slice means
++    float amp_g[G] = {}, ph_g[G] = {};
++    int per = n / G;
++    for (int g = 0; g < G; g++) {
++        float sa = 0, sp = 0;
++        for (int k = g * per; k < (g + 1) * per; k++) {
++            sa += g_amp[k] / mean;
++            sp += g_phase[k] - (slope * g_bin[k] + icpt);
++        }
++        amp_g[g] = sa / per;
++        ph_g[g] = sp / per;
++    }
++
++    float rssi = info->rx_ctrl.rssi;
++    int slot = int((now - g_tick_start_us) / (1000000 / S));
++    if (slot < 0) slot = 0;
++    if (slot >= S) slot = S - 1;
++    portENTER_CRITICAL(&g_lock);
++    for (int g = 0; g < G; g++) {
++        g_acc.profile[g] += amp_g[g];
++        g_acc.phase[g] += ph_g[g];
++        g_acc.series[slot][g] += amp_g[g];
++        g_acc.pseries[slot][g] += ph_g[g];
++    }
++    g_acc.series_n[slot]++;
++    g_acc.profile_n++;
++    g_acc.sum += dev;
++    if (dev > g_acc.max) g_acc.max = dev;
++    g_acc.rssi_sum += rssi;
++    g_acc.rssi_sq += rssi * rssi;
++    g_acc.n++;
++    if (format >= 0 && format < 16) g_acc.format_count[format]++;
++    g_acc.csi_len = info->len;
++    g_acc.active_bins = n;
++    portEXIT_CRITICAL(&g_lock);
++}
++
++void OnTick(void*) {
++    static decltype(g_acc) acc;  // large; keep it off the timer task's stack
++    portENTER_CRITICAL(&g_lock);
++    acc = g_acc;
++    memset(&g_acc, 0, sizeof(g_acc));
++    g_tick_start_us = esp_timer_get_time();
++    portEXIT_CRITICAL(&g_lock);
++    if (acc.n == 0 || !g_on_report) return;
++    static TanaSenseReport r;
++    r.motion = acc.sum / acc.n;
++    r.motion_max = acc.max;
++    r.rssi = acc.rssi_sum / acc.n;
++    float var = acc.rssi_sq / acc.n - r.rssi * r.rssi;
++    r.rssi_std = var > 0 ? std::sqrt(var) : 0;
++    r.packets = acc.n;
++    r.format = -1;
++    int best = 0;
++    for (int f = 0; f < 16; f++) {
++        if (acc.format_count[f] > best) { best = acc.format_count[f]; r.format = f; }
++    }
++    r.csi_len = acc.csi_len;
++    r.active_bins = acc.active_bins;
++    for (int g = 0; g < G; g++) {
++        r.profile[g] = acc.profile_n ? acc.profile[g] / acc.profile_n : 0;
++        r.phase[g] = acc.profile_n ? acc.phase[g] / acc.profile_n : 0;
++    }
++    for (int t = 0; t < S; t++) {
++        r.series_valid[t] = acc.series_n[t] > 0;
++        for (int g = 0; g < G; g++) {
++            r.series[t][g] = acc.series_n[t] ? acc.series[t][g] / acc.series_n[t] : 0;
++            r.pseries[t][g] = acc.series_n[t] ? acc.pseries[t][g] / acc.series_n[t] : 0;
++        }
++    }
++    g_on_report(r);
++}
++
++}  // namespace
++
++TanaSense& TanaSense::GetInstance() {
++    static TanaSense instance;
++    return instance;
++}
++
++void TanaSense::Start(std::function<void(const TanaSenseReport&)> on_report) {
++    if (started_) return;
++
++    wifi_ap_record_t ap;
++    esp_netif_ip_info_t ip;
++    esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
++    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK || netif == nullptr ||
++        esp_netif_get_ip_info(netif, &ip) != ESP_OK || ip.gw.addr == 0) {
++        ESP_LOGW(TAG, "Wi-Fi not ready; sensing not started");
++        return;
++    }
++    memcpy(g_bssid, ap.bssid, 6);
++    g_on_report = std::move(on_report);
++
++    wifi_csi_config_t csi = {};
++    csi.enable = 1;
++    csi.acquire_csi_legacy = 1;  // L-LTF from the ping replies
++    csi.acquire_csi_ht20 = 1;
++    csi.acquire_csi_su = 1;
++    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_csi_config(&csi));
++    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_csi_rx_cb(OnCsi, nullptr));
++    if (esp_wifi_set_csi(true) != ESP_OK) {
++        ESP_LOGE(TAG, "CSI not available");
++        return;
++    }
++
++    // Keep traffic flowing from the router: tiny pings, 20 per second
++    esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
++    cfg.count = ESP_PING_COUNT_INFINITE;
++    cfg.interval_ms = 50;
++    cfg.timeout_ms = 1000;
++    cfg.data_size = 1;
++    cfg.task_stack_size = 2560;
++    ip_addr_set_ip4_u32(&cfg.target_addr, ip.gw.addr);
++    esp_ping_callbacks_t cbs = {};
++    esp_ping_handle_t ping;
++    if (esp_ping_new_session(&cfg, &cbs, &ping) != ESP_OK || esp_ping_start(ping) != ESP_OK) {
++        ESP_LOGE(TAG, "Could not start ping");
++        return;
++    }
++
++    const esp_timer_create_args_t timer_args = {
++        .callback = OnTick, .arg = nullptr, .dispatch_method = ESP_TIMER_TASK,
++        .name = "tana_sense", .skip_unhandled_events = true};
++    esp_timer_handle_t timer;
++    esp_timer_create(&timer_args, &timer);
++    esp_timer_start_periodic(timer, 1000 * 1000);
++    started_ = true;
++    ESP_LOGI(TAG, "Wi-Fi sensing started (gateway " IPSTR ")", IP2STR(&ip.gw));
++}
++
++void TanaSense::Probe(std::vector<ProbeTarget> targets, int seconds,
++                      std::function<void(const std::string&)> on_done) {
++    struct Job {
++        std::vector<ProbeTarget> targets;
++        int seconds;
++        std::function<void(const std::string&)> on_done;
++    };
++    auto* job = new Job{std::move(targets), seconds, std::move(on_done)};
++    xTaskCreate(
++        [](void* arg) {
++            auto* job = static_cast<Job*>(arg);
++            g_probe_count = 0;
++            for (auto& t : job->targets) {
++                if (g_probe_count >= kMaxProbe) break;
++                memcpy(g_probe[g_probe_count].mac, t.mac, 6);
++                g_probe[g_probe_count].rssi_sum = 0;
++                g_probe[g_probe_count].n = 0;
++                g_probe_count++;
++            }
++            wifi_promiscuous_filter_t filter = {.filter_mask = WIFI_PROMIS_FILTER_MASK_DATA};
++            esp_wifi_set_promiscuous_filter(&filter);
++            esp_wifi_set_promiscuous_rx_cb(OnPromiscuous);
++            esp_wifi_set_promiscuous(true);
++
++            // Each light answers our pings by transmitting to the router; we overhear that.
++            std::vector<esp_ping_handle_t> pings;
++            for (int i = 0; i < g_probe_count; i++) {
++                esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
++                cfg.count = job->seconds * 10;
++                cfg.interval_ms = 100;
++                cfg.data_size = 1;
++                cfg.task_stack_size = 2560;
++                ip_addr_t addr;
++                if (!ipaddr_aton(job->targets[i].ip.c_str(), &addr)) continue;
++                cfg.target_addr = addr;
++                esp_ping_callbacks_t cbs = {};
++                esp_ping_handle_t h;
++                if (esp_ping_new_session(&cfg, &cbs, &h) == ESP_OK && esp_ping_start(h) == ESP_OK) {
++                    pings.push_back(h);
++                }
++            }
++            vTaskDelay(pdMS_TO_TICKS(job->seconds * 1000 + 500));
++            esp_wifi_set_promiscuous(false);
++            for (auto h : pings) {
++                esp_ping_stop(h);
++                esp_ping_delete_session(h);
++            }
++
++            std::string json = "{";
++            for (int i = 0; i < g_probe_count; i++) {
++                char item[96];
++                const uint8_t* m = g_probe[i].mac;
++                float rssi = g_probe[i].n ? g_probe[i].rssi_sum / g_probe[i].n : -127;
++                snprintf(item, sizeof(item), "%s\"%02x:%02x:%02x:%02x:%02x:%02x\":{\"rssi\":%.1f,\"n\":%d}",
++                         i ? "," : "", m[0], m[1], m[2], m[3], m[4], m[5], rssi, g_probe[i].n);
++                json += item;
++            }
++            json += "}";
++            g_probe_count = 0;
++            ESP_LOGI(TAG, "Probe result: %s", json.c_str());
++            job->on_done(json);
++            delete job;
++            vTaskDelete(nullptr);
++        },
++        "tana_probe", 4096, job, 3, nullptr);
++}
++
++void TanaSense::StreamRaw(const std::string& host, int port, int node_id) {
++    if (host.empty()) {
++        g_raw_enabled = false;
++        ESP_LOGI(TAG, "Raw CSI stream off");
++        return;
++    }
++    memset(&g_raw_dest, 0, sizeof(g_raw_dest));
++    g_raw_dest.sin_family = AF_INET;
++    g_raw_dest.sin_port = htons(port);
++    if (inet_pton(AF_INET, host.c_str(), &g_raw_dest.sin_addr) != 1) {
++        ESP_LOGW(TAG, "Bad stream host %s", host.c_str());
++        return;
++    }
++    g_raw_node = node_id;
++    if (g_raw_queue == nullptr) {
++        g_raw_queue = xQueueCreate(6, sizeof(RawFrame));
++        xTaskCreate(
++            [](void*) {
++                int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++                static RawFrame f;
++                while (true) {
++                    if (xQueueReceive(g_raw_queue, &f, portMAX_DELAY) == pdTRUE && g_raw_enabled && sock >= 0) {
++                        sendto(sock, f.data, f.len, 0, (struct sockaddr*)&g_raw_dest, sizeof(g_raw_dest));
++                    }
++                }
++            },
++            "csi_udp", 3072, nullptr, 3, nullptr);
++    }
++    g_raw_enabled = true;
++    ESP_LOGI(TAG, "Raw CSI stream to %s:%d (node %d)", host.c_str(), port, node_id);
++}
+diff --git a/main/tana_sense.h b/main/tana_sense.h
+new file mode 100644
+index 0000000..299319e
+--- /dev/null
++++ b/main/tana_sense.h
+@@ -0,0 +1,62 @@
++#ifndef TANA_SENSE_H
++#define TANA_SENSE_H
++
++#include <functional>
++#include <string>
++#include <vector>
++
++// Wi-Fi sensing for presence detection.
++//
++// Pings the gateway ~20 times a second so the router keeps answering, captures the channel
++// state information (CSI) of those replies, and measures how much the per-subcarrier amplitude
++// profile wobbles compared to its recent average. People moving in the room change the
++// multipath, which shows up as wobble. Once a second the callback gets a motion score plus the
++// RSSI spread; deciding "occupied" (and calibrating per room) happens on the server.
++struct TanaSenseReport {
++    static constexpr int kProfileGroups = 16;  // channel slices
++    static constexpr int kSeriesRate = 10;     // samples per second in `series`
++
++    float motion;      // mean normalized amplitude deviation (unitless, ~0.01 still … 0.1+ moving)
++    float motion_max;  // largest single-packet deviation in the second
++    float rssi;        // mean RSSI (dBm)
++    float rssi_std;    // RSSI standard deviation (dB)
++    int packets;       // CSI frames used
++    int format;        // dominant frame format (wifi_rx_bb_format_t: 1 11g, 2 HT, 4 HE SU, ...; -1 unknown)
++    int csi_len;       // CSI buffer length of those frames (bytes)
++    int active_bins;   // subcarriers with data
++    // Signal "shape": mean normalized amplitude per channel slice over the second
++    float profile[kProfileGroups];
++    // Same slices, residual phase after removing the per-packet timing/clock slope (radians)
++    float phase[kProfileGroups];
++    // Normalized amplitude per slice at kSeriesRate Hz, for slow rhythms like breathing
++    float series[kSeriesRate][kProfileGroups];
++    // Residual phase per slice at kSeriesRate Hz (millimetre movement such as breathing)
++    float pseries[kSeriesRate][kProfileGroups];
++    int series_valid[kSeriesRate];
++};
++
++class TanaSense {
++public:
++    static TanaSense& GetInstance();
++    // Starts once the station is connected; safe to call more than once.
++    void Start(std::function<void(const TanaSenseReport&)> on_report);
++
++    // Nearest-light probe: ping each target for `seconds` while overhearing the targets' own
++    // transmissions (promiscuous mode, frames whose transmitter is the target), then report the
++    // mean RSSI per MAC as a JSON object, e.g. {"30:ed:a0:5f:f2:bc":{"rssi":-52.3,"n":31}}.
++    struct ProbeTarget {
++        std::string ip;
++        uint8_t mac[6];
++    };
++    void Probe(std::vector<ProbeTarget> targets, int seconds, std::function<void(const std::string&)> on_done);
++
++    // Also stream every raw CSI frame over UDP in RuView's ADR-018 format
++    // (magic 0xC5110001 header + I/Q bytes) to host:port; empty host stops it.
++    void StreamRaw(const std::string& host, int port, int node_id);
++
++private:
++    TanaSense() = default;
++    bool started_ = false;
++};
++
++#endif
