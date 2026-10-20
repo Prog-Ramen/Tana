@@ -1,4 +1,6 @@
-# Tana
+<p align="center"><img src="docs/tana-logo.png" width="160" alt="Tana logo: a magenta iris made of code"></p>
+
+<h1 align="center">Tana</h1>
 
 <p align="center">
   <a href="https://github.com/Prog-Ramen/Tana/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Prog-Ramen/Tana" alt="License"></a>
