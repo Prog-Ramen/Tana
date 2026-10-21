@@ -8,8 +8,8 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-3776AB" alt="Python">
 </p>
 <p align="center">
-  <a href="#trade-offs"><img src="https://img.shields.io/badge/advantage__tradeoffs-Adapter%20pattern%2C%20Plugin%20architecture%2C%20Graceful%20degradation%2C%20Data%20locality%2C%20Progressive%20disclosure-2ea44f" alt="advantage_tradeoffs: Adapter pattern, Plugin architecture, Graceful degradation, Data locality, Progressive disclosure"></a>
-  <a href="#trade-offs"><img src="https://img.shields.io/badge/disadvantage__tradeoffs-External%20dependency%2C%20Thin%20clients%2C%20Narrow%20hardware%20support%2C%20Ambient%20authority-d97706" alt="disadvantage_tradeoffs: External dependency, Thin clients, Narrow hardware support, Ambient authority"></a>
+  <a href="#trade-offs"><img src="https://img.shields.io/badge/%2B%20tradeoffs-Adapter%20pattern%2C%20Plugin%20architecture%2C%20Graceful%20degradation%2C%20Data%20locality%2C%20Progressive%20disclosure-2ea44f" alt="+ tradeoffs: Adapter pattern, Plugin architecture, Graceful degradation, Data locality, Progressive disclosure"></a>
+  <a href="#trade-offs"><img src="https://img.shields.io/badge/--%20tradeoffs-External%20dependency%2C%20Thin%20clients%2C%20Narrow%20hardware%20support%2C%20Ambient%20authority-d97706" alt="- tradeoffs: External dependency, Thin clients, Narrow hardware support, Ambient authority"></a>
 </p>
 
 **Tana is an all-in-one AI assistant you host yourself: a web app for your phone, laptop or car, voice in and
