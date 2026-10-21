@@ -8,12 +8,12 @@
   <img src="https://img.shields.io/badge/python-3.10%2B-3776AB" alt="Python">
 </p>
 <p align="center">
-  <a href="#trade-offs"><img src="https://img.shields.io/badge/%2B%20tradeoffs-Adapter%20pattern%2C%20Plugin%20architecture%2C%20Graceful%20degradation%2C%20Data%20locality%2C%20Progressive%20disclosure-2ea44f" alt="+ tradeoffs: Adapter pattern, Plugin architecture, Graceful degradation, Data locality, Progressive disclosure"></a>
-  <a href="#trade-offs"><img src="https://img.shields.io/badge/--%20tradeoffs-External%20dependency%2C%20Thin%20clients%2C%20Narrow%20hardware%20support%2C%20Ambient%20authority-d97706" alt="- tradeoffs: External dependency, Thin clients, Narrow hardware support, Ambient authority"></a>
+  <a href="#trade-offs"><img src="https://img.shields.io/badge/%2B%20tradeoffs-Adapter%20pattern%2C%20Data%20locality%2C%20Progressive%20disclosure%2C%20Defense%20in%20depth-2ea44f" alt="+ tradeoffs: Adapter pattern, Data locality, Progressive disclosure, Defense in depth"></a>
+  <a href="#trade-offs"><img src="https://img.shields.io/badge/--%20tradeoffs-External%20dependency%2C%20Ambient%20authority-d97706" alt="- tradeoffs: External dependency, Ambient authority"></a>
 </p>
 
 **Tana is an all-in-one AI assistant you host yourself: a web app for your phone, laptop or car, voice in and
-out, and small voice boards around the house, with the agent harness of your choice behind it.**
+out, with the agent harness of your choice behind it.**
 
 Tana does not have a brain of its own: you pick the backend. It ships with adapters for
 [Rameness](https://github.com/Prog-Ramen/Rameness), Claude Code, Codex, pi and dsh, and switching is one setting.
@@ -33,19 +33,16 @@ Tana is the interface; the backend does the thinking, the coding and the researc
   agent.
 - **Voice everywhere.** A phone can be the microphone for another screen (a car's browser, a laptop); a Siri
   Shortcut asks Tana with the phone locked.
-- **Voice boards** (the [`boards` plugin](plugins/boards/README.md)): small ESP32 boards with a microphone, speaker
-  and screen, woken with "Hey Tana", which talk to the same backend, switch lights and announce finished work.
-- **Only what you set up is shown.** No API key, no Claude chats; no boards server, no boards screen; a harness
-  with no sessions gets no tab.
-- **Monitoring.** Prometheus metrics from the web app and the boards, and Grafana dashboards for both.
+- **Only what you set up is shown.** No API key, no Claude chats; a harness with no sessions gets no
+  tab.
+- **Monitoring.** Prometheus metrics from the web app, and a Grafana dashboard.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `server/` | The web app (`tana`): `tana/app.py` (entry point), `webapp.py` (HTTP API), `static/` (UI), `assistant.py` (backends), `voice/` (speech recognition and synthesis, shared with plugins), `clients.py` (Rameness and tana-boards APIs) |
-| `plugins/boards/` | `tana-boards`: the voice boards' server, its firmware build and tools |
-| `dashboards/` | Grafana dashboards |
+| `server/` | The web app (`tana`): `tana/app.py` (entry point), `webapp.py` (HTTP API), `static/` (UI), `assistant.py` (backends), `voice/` (speech recognition and synthesis), `clients.py` (the Rameness API) |
+| `dashboards/` | Grafana dashboard |
 
 ## Install
 
@@ -54,7 +51,7 @@ reach the web app from outside your network.
 
 ```bash
 git clone https://github.com/Prog-Ramen/Tana.git /opt/tana && cd /opt/tana/server
-uv venv --python 3.12 && uv pip install -e .            # add `-e ../plugins/boards` for the voice boards
+uv venv --python 3.12 && uv pip install -e .
 cp config.example.yaml config.yaml                        # pick the backend, the proxy's address, ...
 ```
 
@@ -74,7 +71,7 @@ code (TOTP). Port 8005 must never be forwarded to the internet. Sign in on `:800
 
 | `assistant.backend` | Needs | Notes |
 |---|---|---|
-| `rameness` | a Rameness manager (`rameness fleet up --home`) at `assistant.url` | Can call the client's tools (a board's volume, the lights) and announce work that finishes later. |
+| `rameness` | a Rameness manager (`rameness fleet up --home`) at `assistant.url` | Can call the client's tools and announce work that finishes later. |
 | `claude-code` | `claude` on the PATH, signed in | One Claude Code session per chat. |
 | `codex` | `codex` on the PATH, signed in | One Codex thread per chat. |
 | `pi` | `pi` with a provider configured | One pi session per chat. |
@@ -96,16 +93,13 @@ Adding another is a class in `server/tana/assistant.py`: implement `turn()` and 
 
 ## Monitoring
 
-The web app serves `GET /metrics` on its local port (`:8005/metrics`) and tana-boards on its own (`:8003/metrics`),
-in the Prometheus format. Import [`dashboards/tana.json`](dashboards/tana.json) and
-[`dashboards/tana-boards.json`](dashboards/tana-boards.json) in Grafana.
+The web app serves `GET /metrics` on its local port (`:8005/metrics`) in the Prometheus format. Import
+[`dashboards/tana.json`](dashboards/tana.json) in Grafana.
 
 ```yaml
 scrape_configs:
   - job_name: tana
     static_configs: [{targets: ["127.0.0.1:8005"]}]
-  - job_name: tana-boards
-    static_configs: [{targets: ["127.0.0.1:8003"]}]
 ```
 
 ## Tests
@@ -121,21 +115,17 @@ The design choices behind the badges at the top, named after the patterns and tr
 | | Trade-off | What it means here |
 |---|---|---|
 | Advantage | **Adapter pattern** | One assistant interface, with adapters for Rameness, Claude Code, Codex, pi and dsh; switching is one setting. |
-| Advantage | **Plugin architecture** | The voice boards are a separate service (`tana-boards`) that Tana doesn't need in order to run. |
-| Advantage | **Graceful degradation** | Without the server, boards keep running their room's automatic lights; without a backend, they keep their non-AI functions. |
 | Advantage | **Data locality** | Speech recognition (Whisper) and synthesis (Kokoro) run on your machine. |
-| Advantage | **Progressive disclosure** | Only what is set up is shown: no API key, no Claude chats; no boards server, no boards screen. |
+| Advantage | **Progressive disclosure** | Only what is set up is shown: no API key, no Claude chats; a harness with no sessions gets no tab. |
+| Advantage | **Defense in depth** | HTTPS through a trusted proxy only, a password plus an authenticator code, a custom header on every change, a strict Content Security Policy, and agents only from allowed networks. |
 | Disadvantage | **External dependency** | Tana has no brain of its own; every answer needs a configured backend. |
-| Disadvantage | **Thin clients** | Boards stream audio to your server, which hears the wake phrase; voice doesn't work offline. |
-| Disadvantage | **Narrow hardware support** | One board model has been built and tested. |
 | Disadvantage | **Ambient authority** | Agents started from the web run with the permissions of the user running Tana. |
 
 ## License and disclaimer
 
-Licensed under the [Apache License 2.0](LICENSE). Copyright 2026 Prog-Ramen. The board firmware is built from
-[xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) (MIT License).
+Licensed under the [Apache License 2.0](LICENSE). Copyright 2026 Prog-Ramen.
 
-Tana is provided **as is, without warranty of any kind**. It controls devices, listens through microphones, can be
+Tana is provided **as is, without warranty of any kind**. It listens through microphones, can be
 exposed to the internet, and starts AI agents that run commands on your machine. You are solely responsible for
 how you install, secure and use it, for the people and places its microphones can hear, for every action taken
 through it, and for complying with applicable laws and the terms of the services you connect. Tana is not a safety

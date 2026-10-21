@@ -17,8 +17,8 @@ DEFAULTS: dict = {
     "assistant": {"backend": "rameness", "url": "http://127.0.0.1:7788", "timeout": 300},
     # Rameness's own views (its chats, agents and the decisions waiting on you), through its HTTP API
     "rameness": {"url": "http://127.0.0.1:7788"},
-    # tana-boards: the voice boards' server, for the boards screen (volume, brightness, rooms, lights)
-    "boards": {"url": "http://127.0.0.1:8003"},
+    # optional: a tana-boards server, for the boards screen (hidden unless set)
+    "boards": {"url": None},
     "web": {
         # Put an HTTPS reverse proxy in front: it terminates TLS and forwards here. Connections from any other
         # address than trusted_proxies are refused, and X-Forwarded-For is trusted only from them.

@@ -8,8 +8,6 @@ assistant:
 
 rameness:
   url: http://127.0.0.1:7788    # Rameness's own views (chats, agents, decisions waiting on you); omit to hide them
-boards:
-  url: http://127.0.0.1:8003    # tana-boards, for the boards screen; omit to hide it
 
 web:
   port: 8004

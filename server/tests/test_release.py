@@ -1,4 +1,4 @@
-"""The example configs load, and the metrics render as Prometheus text."""
+"""The example config loads, and the metrics render as Prometheus text."""
 import re
 import unittest
 from pathlib import Path
@@ -20,16 +20,6 @@ class ExampleConfigs(unittest.TestCase):
         unknown = set(yaml.safe_load((ROOT / "server" / "config.example.yaml").read_text())) - set(config_mod.DEFAULTS)
         self.assertEqual(unknown, set())                    # every section of the example is a real setting
 
-    def test_the_boards_example_config_loads_over_the_defaults(self):
-        import sys
-        sys.path.insert(0, str(ROOT / "plugins" / "boards"))
-        from tana_boards import config as boards_config
-        path = ROOT / "plugins" / "boards" / "config.example.yaml"
-        cfg = boards_config.load(str(path))
-        self.assertEqual(cfg["server"]["port"], 8003)
-        self.assertEqual(cfg["assistant"]["backend"], "rameness")
-        unknown = set(yaml.safe_load(path.read_text())) - set(boards_config.DEFAULTS)
-        self.assertEqual(unknown, set())
 
 
 class Metrics(unittest.TestCase):
@@ -52,8 +42,8 @@ class Metrics(unittest.TestCase):
                 self.assertRegex(line, sample)
 
     def test_label_values_are_escaped(self):
-        metrics.inc("tana_boards_tool_calls_total", tool='say "hi"\nnow')
-        self.assertIn('tool="say \\"hi\\" now"', metrics.render())
+        metrics.inc("tana_chat_messages_total", brain='say "hi"\nnow')
+        self.assertIn('brain="say \\"hi\\" now"', metrics.render())
 
 
 if __name__ == "__main__":
